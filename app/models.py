@@ -19,6 +19,17 @@ class WebhookConfig(BaseModel):
     headers: Optional[Dict[str, str]] = None
     metadata: Optional[Dict[str, str]] = None
 
+# Browser actions (Firecrawl v2 scrape "actions")
+class ScrapeAction(BaseModel):
+    type: str
+    selector: Optional[str] = None
+    text: Optional[str] = None
+    key: Optional[str] = None
+    script: Optional[str] = None
+    milliseconds: Optional[int] = None
+    direction: Optional[str] = None
+    full_page: Optional[bool] = Field(default=None, alias="fullPage")
+
 # Scrape options
 class ScrapeOptions(BaseModel):
     formats: Optional[List[Literal["markdown", "html", "rawHtml", "content", "links", "screenshot"]]] = ["markdown"]
@@ -34,6 +45,7 @@ class ScrapeOptions(BaseModel):
     remove_base64_images: Optional[bool] = None
     use_relative_links: Optional[bool] = False
     include_file_body: Optional[bool] = False
+    actions: Optional[List[ScrapeAction]] = None
     
 # Document metadata
 class DocumentMetadata(BaseModel):
@@ -92,6 +104,9 @@ class CrawlRequest(BaseModel):
     allow_external_links: Optional[bool] = False
     include_subdomains: Optional[bool] = False
     ignore_sitemap: Optional[bool] = False
+    # v2 compatibility knobs (mapped from ignoreQueryParameters / deduplicateSimilarURLs)
+    ignore_query_parameters: Optional[bool] = False
+    deduplicate_similar_urls: Optional[bool] = False
     scrape_options: Optional[ScrapeOptions] = None
     webhook: Optional[Union[str, WebhookConfig]] = None
     delay: Optional[int] = 0

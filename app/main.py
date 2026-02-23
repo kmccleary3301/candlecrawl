@@ -11,10 +11,11 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 import asyncio
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 import xml.etree.ElementTree as ET
 import httpx
+import hashlib
 import json
 import time
 from loguru import logger
@@ -34,7 +35,7 @@ from app.models import (
 )
 from app.scraper import scraper
 from app.frontier import MemoryFrontier
-from app.providers.serper import SerperClient, SerperSearchRequest
+from app.providers.serper import SerperClient, SerperImageRequest, SerperNewsRequest, SerperSearchRequest
 from app.providers.openrouter import OpenRouterClient, OpenRouterChatRequest, ORMessage
 from app.providers.scrapedo import ScrapeDoClient, ScrapeDoRequest
 from app.hermes_bcas import HermesBStar04
@@ -94,6 +95,13 @@ except Exception as e:
 # In-memory storage for jobs when Redis is not available
 job_storage: Dict[str, Dict[str, Any]] = {}
 _cancelled_jobs: set[str] = set()
+_cancelled_batch_jobs: set[str] = set()
+
+# In-memory cache fallback (used when Redis is unavailable).
+_scrape_cache_memory: Dict[str, Dict[str, Any]] = {}
+
+# In-memory idempotency store fallback (used when Redis is unavailable).
+_idempotency_memory: Dict[str, Dict[str, Any]] = {}
 
 def serialize_job_data(data: Dict[str, Any]) -> str:
     """Serialize job data to JSON string, handling datetime objects"""
@@ -113,6 +121,358 @@ def deserialize_job_data(data: str) -> Dict[str, Any]:
         job_data['expires_at'] = datetime.fromisoformat(job_data['expires_at'])
     
     return job_data
+
+
+def _ms_to_seconds(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        # Firecrawl v2 semantics use milliseconds; internal scraper expects seconds.
+        ms = float(value)
+    except Exception:
+        return None
+    if ms <= 0:
+        return None
+    # Round up to avoid 0s timeouts.
+    return max(1, int((ms + 999) // 1000))
+
+
+def _scrape_options_from_v2(payload: Dict[str, Any]) -> ScrapeOptions:
+    formats_in = payload.get("formats")
+    formats: list[str] = []
+    if isinstance(formats_in, list):
+        for item in formats_in:
+            if isinstance(item, str):
+                if item in {"markdown", "html", "rawHtml", "links", "screenshot"}:
+                    formats.append(item)
+                elif item == "screenshot@fullPage":
+                    formats.append("screenshot")
+            elif isinstance(item, dict):
+                if item.get("type") == "screenshot":
+                    formats.append("screenshot")
+                # json/extract/branding/changeTracking/summary are ignored (not supported by this server)
+    if not formats:
+        formats = ["markdown"]
+
+    return ScrapeOptions(
+        formats=formats,
+        headers=payload.get("headers"),
+        include_tags=payload.get("includeTags"),
+        exclude_tags=payload.get("excludeTags"),
+        only_main_content=payload.get("onlyMainContent"),
+        wait_for=_ms_to_seconds(payload.get("waitFor")),
+        timeout=_ms_to_seconds(payload.get("timeout")),
+        location=payload.get("location"),
+        mobile=payload.get("mobile"),
+        skip_tls_verification=payload.get("skipTlsVerification"),
+        remove_base64_images=payload.get("removeBase64Images"),
+        use_relative_links=payload.get("useRelativeLinks"),
+        include_file_body=payload.get("includeFileBody"),
+        actions=payload.get("actions") if isinstance(payload.get("actions"), list) else None,
+    )
+
+
+def _v2_document_from_v1(doc: FirecrawlDocument | Dict[str, Any]) -> Dict[str, Any]:
+    data = doc.model_dump() if hasattr(doc, "model_dump") else (doc or {})
+    meta_in = data.get("metadata") or {}
+    meta_out: Dict[str, Any] = {}
+
+    if isinstance(meta_in, dict):
+        if meta_in.get("title") is not None:
+            meta_out["title"] = meta_in.get("title")
+        if meta_in.get("description") is not None:
+            meta_out["description"] = meta_in.get("description")
+        if meta_in.get("language") is not None:
+            meta_out["language"] = meta_in.get("language")
+        if meta_in.get("source_url") is not None:
+            meta_out["sourceURL"] = meta_in.get("source_url")
+        if meta_in.get("status_code") is not None:
+            meta_out["statusCode"] = meta_in.get("status_code")
+        if meta_in.get("content_type") is not None:
+            meta_out["contentType"] = meta_in.get("content_type")
+        if meta_in.get("file_metadata") is not None:
+            meta_out["fileMetadata"] = meta_in.get("file_metadata")
+        if meta_in.get("blocked") is not None:
+            meta_out["blocked"] = meta_in.get("blocked")
+        if meta_in.get("blocked_reason") is not None:
+            meta_out["blockedReason"] = meta_in.get("blocked_reason")
+
+    out: Dict[str, Any] = {}
+    if data.get("markdown") is not None:
+        out["markdown"] = data.get("markdown")
+    if data.get("html") is not None:
+        out["html"] = data.get("html")
+    if data.get("raw_html") is not None:
+        out["rawHtml"] = data.get("raw_html")
+    if data.get("rawHtml") is not None:
+        out["rawHtml"] = data.get("rawHtml")
+    if data.get("links") is not None:
+        out["links"] = data.get("links")
+    if data.get("screenshot") is not None:
+        out["screenshot"] = data.get("screenshot")
+    if meta_out:
+        out["metadata"] = meta_out
+    else:
+        # Preserve any existing v2-shaped metadata if present.
+        if isinstance(meta_in, dict) and meta_in:
+            out["metadata"] = meta_in
+
+    return out
+
+
+def _canonicalize_url(
+    url: str,
+    *,
+    ignore_query_parameters: bool = False,
+    deduplicate_similar_urls: bool = False,
+) -> str:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    netloc = (parsed.netloc or "").lower()
+
+    # Drop default ports.
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    if scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[:-4]
+
+    path = parsed.path or "/"
+    if deduplicate_similar_urls and path != "/" and path.endswith("/"):
+        path = path[:-1]
+
+    query = parsed.query or ""
+    if ignore_query_parameters:
+        query = ""
+    elif deduplicate_similar_urls and query:
+        # Stable query ordering to reduce duplicates like ?b=2&a=1 vs ?a=1&b=2
+        query = urlencode(sorted(parse_qsl(query, keep_blank_values=True)))
+
+    # Fragments never affect content for HTTP requests.
+    fragment = ""
+
+    return urlunparse((scheme, netloc, path, parsed.params, query, fragment))
+
+
+def _remove_empty_top_level(obj: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in obj.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        if isinstance(v, list) and len(v) == 0:
+            continue
+        if isinstance(v, dict) and len(v) == 0:
+            continue
+        out[k] = v
+    return out
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _scrape_cache_key(url: str, payload: Dict[str, Any]) -> str:
+    # Keep this stable and conservative: include any request field that could
+    # impact output once we fully implement the v2 surface.
+    fingerprint = _remove_empty_top_level(
+        {
+            "url": _canonicalize_url(url),
+            "formats": payload.get("formats"),
+            "onlyMainContent": payload.get("onlyMainContent"),
+            "includeTags": payload.get("includeTags"),
+            "excludeTags": payload.get("excludeTags"),
+            "headers": payload.get("headers"),
+            "waitFor": payload.get("waitFor"),
+            "timeout": payload.get("timeout"),
+            "location": payload.get("location"),
+            "mobile": payload.get("mobile"),
+            "skipTlsVerification": payload.get("skipTlsVerification"),
+            "removeBase64Images": payload.get("removeBase64Images"),
+            "useRelativeLinks": payload.get("useRelativeLinks"),
+            "includeFileBody": payload.get("includeFileBody"),
+            "actions": payload.get("actions"),
+            "parsers": payload.get("parsers"),
+            "proxy": payload.get("proxy"),
+            "blockAds": payload.get("blockAds"),
+            "fastMode": payload.get("fastMode"),
+        }
+    )
+    raw = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"cache:scrape:{digest}"
+
+
+def _get_cached_scrape(cache_key: str, max_age_ms: int | None) -> Dict[str, Any] | None:
+    if not getattr(settings, "cache_enabled", True):
+        return None
+    if max_age_ms is None or max_age_ms <= 0:
+        return None
+
+    entry: Dict[str, Any] | None = None
+    if redis_available:
+        try:
+            raw = redis_client.get(cache_key)
+            if raw:
+                entry = json.loads(raw)
+        except Exception:
+            entry = None
+    else:
+        entry = _scrape_cache_memory.get(cache_key)
+
+    if not entry or not isinstance(entry, dict):
+        return None
+
+    cached_at_ms = entry.get("cached_at_ms")
+    if not isinstance(cached_at_ms, int):
+        return None
+    if (_now_ms() - cached_at_ms) > max_age_ms:
+        return None
+    data = entry.get("data")
+    if not isinstance(data, dict):
+        return None
+    # Never serve cached error/blocked responses: these can be transient
+    # (e.g., bot mitigation, UA changes, temporary upstream failures) and
+    # would otherwise "poison" the cache for successful retries.
+    meta = data.get("metadata")
+    if isinstance(meta, dict):
+        status = meta.get("statusCode")
+        if isinstance(status, int) and status >= 400:
+            return None
+        if meta.get("blocked"):
+            return None
+    return data
+
+
+def _set_cached_scrape(cache_key: str, data: Dict[str, Any]) -> None:
+    if not getattr(settings, "cache_enabled", True):
+        return
+    entry = {"cached_at_ms": _now_ms(), "data": data}
+    ttl_seconds = int(getattr(settings, "cache_ttl_seconds", 172800))
+    if redis_available:
+        try:
+            redis_client.set(cache_key, json.dumps(entry, ensure_ascii=False), ex=ttl_seconds)
+        except Exception:
+            pass
+    else:
+        _scrape_cache_memory[cache_key] = entry
+
+
+def _is_cacheable_v2_scrape_data(data: Dict[str, Any]) -> bool:
+    """Return True if this v2 scrape response should be cached.
+
+    We intentionally avoid caching error/blocked responses since those are
+    often transient and can prevent the system from recovering on retry.
+    """
+    if not isinstance(data, dict):
+        return False
+    meta = data.get("metadata")
+    if not isinstance(meta, dict):
+        return True
+    status = meta.get("statusCode")
+    if isinstance(status, int) and status >= 400:
+        return False
+    if meta.get("blocked"):
+        return False
+    return True
+
+
+async def _v2_scrape_data(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    max_age_raw = payload.get("maxAge")
+    if max_age_raw is None:
+        max_age_ms = int(getattr(settings, "cache_default_max_age_ms", 172800000))
+    else:
+        try:
+            max_age_ms = int(max_age_raw)
+        except Exception:
+            max_age_ms = int(getattr(settings, "cache_default_max_age_ms", 172800000))
+
+    store_in_cache = _coerce_bool(payload.get("storeInCache"), True)
+
+    cache_key = _scrape_cache_key(url, payload)
+    cached = _get_cached_scrape(cache_key, max_age_ms)
+    if cached is not None:
+        return cached
+
+    options = _scrape_options_from_v2(payload)
+    document = await scraper.scrape_url(url, options)
+    data = _v2_document_from_v1(document)
+    if store_in_cache and _is_cacheable_v2_scrape_data(data):
+        _set_cached_scrape(cache_key, data)
+    return data
+
+
+def _get_idempotency_key(request: Request) -> str | None:
+    key = request.headers.get("x-idempotency-key") or request.headers.get("X-Idempotency-Key")
+    if not key:
+        return None
+    key = key.strip()
+    return key or None
+
+
+def _idempotency_storage_key(scope: str, key: str) -> str:
+    # `scope` is per-endpoint, e.g. "v2:crawl" or "v2:batch"
+    return f"idempotency:{scope}:{key}"
+
+
+def _payload_hash_for_idempotency(payload: Dict[str, Any]) -> str:
+    # Exclude request fields that can change between retries but shouldn't
+    # affect idempotency (origin/integration are advisory).
+    cleaned = {k: v for k, v in payload.items() if k not in {"origin", "integration"}}
+    raw = json.dumps(cleaned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_idempotent_response(scope: str, key: str, payload_hash: str) -> Dict[str, Any] | None:
+    storage_key = _idempotency_storage_key(scope, key)
+    entry: Dict[str, Any] | None = None
+    if redis_available:
+        try:
+            raw = redis_client.get(storage_key)
+            if raw:
+                entry = json.loads(raw)
+        except Exception:
+            entry = None
+    else:
+        entry = _idempotency_memory.get(storage_key)
+
+    if not entry:
+        return None
+    if entry.get("payload_hash") != payload_hash:
+        raise HTTPException(status_code=409, detail="Idempotency key already used with different request payload")
+    response = entry.get("response")
+    if not isinstance(response, dict):
+        return None
+    return response
+
+
+def _set_idempotent_response(scope: str, key: str, payload_hash: str, response: Dict[str, Any]) -> None:
+    storage_key = _idempotency_storage_key(scope, key)
+    entry = {"payload_hash": payload_hash, "response": response, "created_at_ms": _now_ms()}
+    ttl_seconds = 86400  # match job expiry window
+    if redis_available:
+        try:
+            redis_client.set(storage_key, json.dumps(entry, ensure_ascii=False), ex=ttl_seconds)
+        except Exception:
+            pass
+    else:
+        _idempotency_memory[storage_key] = entry
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -158,6 +518,24 @@ async def scrape_url(request: Request, scrape_request: ScrapeRequest, remote_add
             success=False,
             error=str(e)
         )
+
+
+# --- Firecrawl v2 compatibility endpoints (for firecrawl-js v2 / firecrawl-mcp) ---
+
+@app.post("/v2/scrape")
+@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+async def v2_scrape(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
+    url = payload.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return {"success": False, "error": "Missing url"}
+    parsed_url = urlparse(url)
+    if not (parsed_url.scheme and parsed_url.netloc):
+        return {"success": False, "error": f"Invalid URL: {url}. Please include http:// or https://."}
+    try:
+        data = await _v2_scrape_data(url, payload)
+        return {"success": True, "data": data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.post("/v1/scrape/bulk", response_model=List[ScrapeResponse])
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
@@ -322,6 +700,125 @@ async def export_crawl(job_id: str, format: str = "jsonl"):
         lines = "\n".join(json.dumps(d) for d in docs)
         return Response(content=lines, media_type="application/x-ndjson")
     return {"success": True, "data": docs}
+
+
+@app.post("/v2/crawl")
+@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+async def v2_crawl(request: Request, payload: Dict[str, Any], background_tasks: BackgroundTasks, remote_addr: str = Depends(get_remote_address)):
+    url = payload.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return {"success": False, "error": "Missing url"}
+    try:
+        idem_key = _get_idempotency_key(request)
+        payload_hash = _payload_hash_for_idempotency(payload) if idem_key else ""
+        if idem_key:
+            existing = _get_idempotent_response("v2:crawl", idem_key, payload_hash)
+            if existing is not None:
+                return existing
+
+        sitemap = payload.get("sitemap")
+        ignore_sitemap = sitemap == "skip"
+
+        crawl_request = CrawlRequest(
+            url=url,
+            include_paths=payload.get("includePaths"),
+            exclude_paths=payload.get("excludePaths"),
+            max_depth=payload.get("maxDiscoveryDepth") or 2,
+            limit=payload.get("limit") or 50,
+            allow_external_links=payload.get("allowExternalLinks") or False,
+            include_subdomains=payload.get("allowSubdomains") or False,
+            ignore_sitemap=ignore_sitemap,
+            ignore_query_parameters=_coerce_bool(payload.get("ignoreQueryParameters"), False),
+            deduplicate_similar_urls=_coerce_bool(payload.get("deduplicateSimilarURLs"), False),
+            scrape_options=_scrape_options_from_v2(payload.get("scrapeOptions") or {}),
+            webhook=payload.get("webhook"),
+            delay=payload.get("delay") or 0,
+            max_concurrency=payload.get("maxConcurrency") or 10,
+        )
+
+        job_id = str(uuid.uuid4())
+        job_data = {
+            "id": job_id,
+            "url": crawl_request.url,
+            "status": "scraping",
+            "completed": 0,
+            "total": 0,
+            "credits_used": 0,
+            "expires_at": utc_now() + timedelta(hours=24),
+            "data": [],
+            "request": crawl_request.model_dump(),
+            "v2_sitemap_mode": sitemap,
+        }
+
+        if redis_available:
+            redis_client.set(f"crawl:{job_id}", serialize_job_data(job_data), ex=86400)
+        else:
+            job_storage[job_id] = job_data
+
+        background_tasks.add_task(crawl_background_task, job_id, crawl_request)
+
+        response = {"success": True, "id": job_id, "url": crawl_request.url}
+        if idem_key:
+            _set_idempotent_response("v2:crawl", idem_key, payload_hash, response)
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/v2/crawl/{job_id}")
+async def v2_get_crawl_status(job_id: str):
+    if redis_available:
+        job_data_str = redis_client.get(f"crawl:{job_id}")
+        if job_data_str:
+            job_data = deserialize_job_data(job_data_str.decode("utf-8"))
+        else:
+            job_data = None
+    else:
+        job_data = job_storage.get(job_id)
+
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Crawl job not found")
+
+    expires_at = job_data.get("expires_at")
+    expires_at_str = expires_at.isoformat() if isinstance(expires_at, datetime) else expires_at
+    docs_in = job_data.get("data") or []
+    docs_out = [_v2_document_from_v1(d) for d in docs_in]
+
+    return {
+        "success": True,
+        "status": job_data.get("status"),
+        "completed": job_data.get("completed", 0),
+        "total": job_data.get("total", 0),
+        "creditsUsed": job_data.get("credits_used"),
+        "expiresAt": expires_at_str,
+        "next": job_data.get("next"),
+        "data": docs_out,
+    }
+
+
+@app.delete("/v2/crawl/{job_id}")
+async def v2_cancel_crawl(job_id: str):
+    _cancelled_jobs.add(job_id)
+    if redis_available:
+        job_data_str = redis_client.get(f"crawl:{job_id}")
+        if job_data_str:
+            job_data = deserialize_job_data(job_data_str.decode("utf-8"))
+            job_data.update({"status": "cancelled"})
+            redis_client.set(f"crawl:{job_id}", serialize_job_data(job_data), ex=86400)
+    else:
+        job_data = job_storage.get(job_id)
+        if job_data:
+            job_data.update({"status": "cancelled"})
+            job_storage[job_id] = job_data
+    return {"status": "cancelled"}
+
+
+@app.get("/v2/crawl/{job_id}/errors")
+async def v2_crawl_errors(job_id: str):
+    # Minimal compatibility: return empty error set.
+    return {"success": True, "data": {"errors": [], "robotsBlocked": []}}
 
 @app.post("/v1/batch-scrape", response_model=BatchScrapeResponse)
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
@@ -497,6 +994,331 @@ async def get_sitemap_links(url: str) -> List[str]:
     
     return links
 
+
+@app.post("/v2/map")
+@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+async def v2_map(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
+    url = payload.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return {"success": False, "error": "Missing url"}
+    try:
+        links: list[str] = []
+        seen: set[str] = set()
+        base_domain = urlparse(_canonicalize_url(url)).netloc
+        sitemap_mode = payload.get("sitemap")
+        include_subdomains = _coerce_bool(payload.get("includeSubdomains"), False)
+        limit = payload.get("limit")
+        search_filter = payload.get("search")
+        ignore_query_parameters = _coerce_bool(payload.get("ignoreQueryParameters"), False)
+
+        ignore_sitemap = sitemap_mode == "skip"
+        only_sitemap = sitemap_mode == "only"
+        if not ignore_sitemap:
+            try:
+                for link in await get_sitemap_links(url):
+                    link = _canonicalize_url(link, ignore_query_parameters=ignore_query_parameters)
+                    if link not in seen:
+                        seen.add(link)
+                        links.append(link)
+            except Exception:
+                pass
+
+        if not only_sitemap and (not links or not ignore_sitemap):
+            options = ScrapeOptions(formats=["links"])
+            document = await scraper.scrape_url(url, options)
+            if document.links:
+                for link in document.links:
+                    link = _canonicalize_url(link, ignore_query_parameters=ignore_query_parameters)
+                    parsed_link = urlparse(link)
+                    if parsed_link.scheme.lower() not in {"http", "https"} or not parsed_link.netloc:
+                        continue
+
+                    if include_subdomains:
+                        if parsed_link.netloc != base_domain and not parsed_link.netloc.endswith("." + base_domain):
+                            continue
+                    else:
+                        if parsed_link.netloc != base_domain:
+                            continue
+
+                    if link not in seen:
+                        seen.add(link)
+                        links.append(link)
+
+        if isinstance(search_filter, str) and search_filter.strip():
+            token = search_filter.strip()
+            links = [l for l in links if token in l]
+
+        if isinstance(limit, int) and limit > 0 and len(links) > limit:
+            links = links[:limit]
+
+        return {"success": True, "links": links}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/v2/batch/scrape")
+@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+async def v2_batch_scrape(request: Request, payload: Dict[str, Any], background_tasks: BackgroundTasks, remote_addr: str = Depends(get_remote_address)):
+    urls = payload.get("urls")
+    if not isinstance(urls, list) or not urls:
+        return {"success": False, "error": "No URLs provided"}
+
+    idem_key = _get_idempotency_key(request)
+    payload_hash = _payload_hash_for_idempotency(payload) if idem_key else ""
+    if idem_key:
+        existing = _get_idempotent_response("v2:batch", idem_key, payload_hash)
+        if existing is not None:
+            return existing
+
+    # Map v2 scrape options to v1 BatchScrapeRequest
+    options_payload: Dict[str, Any] = payload.copy()
+    options_payload.pop("urls", None)
+    scrape_options = _scrape_options_from_v2(options_payload)
+
+    batch_request = BatchScrapeRequest(
+        urls=[str(u) for u in urls],
+        formats=scrape_options.formats,
+        headers=scrape_options.headers,
+        include_tags=scrape_options.include_tags,
+        exclude_tags=scrape_options.exclude_tags,
+        only_main_content=bool(scrape_options.only_main_content) if scrape_options.only_main_content is not None else False,
+        wait_for=scrape_options.wait_for,
+        timeout=scrape_options.timeout,
+        location=scrape_options.location,
+        mobile=bool(scrape_options.mobile) if scrape_options.mobile is not None else False,
+        skip_tls_verification=bool(scrape_options.skip_tls_verification) if scrape_options.skip_tls_verification is not None else False,
+        remove_base64_images=bool(scrape_options.remove_base64_images) if scrape_options.remove_base64_images is not None else True,
+        max_concurrency=int(payload.get("maxConcurrency") or 5),
+    )
+
+    invalid_urls: list[str] = []
+    valid_urls: list[str] = []
+    for u in batch_request.urls:
+        parsed = urlparse(u)
+        if parsed.scheme and parsed.netloc:
+            valid_urls.append(u)
+        else:
+            invalid_urls.append(u)
+    if not valid_urls:
+        return {"success": False, "error": "No valid URLs provided", "invalidURLs": invalid_urls}
+
+    job_id = str(uuid.uuid4())
+    job_data = {
+        "id": job_id,
+        "status": "scraping",
+        "completed": 0,
+        "total": len(valid_urls),
+        "credits_used": 0,
+        "expires_at": utc_now() + timedelta(hours=24),
+        "data": [],
+        "request": payload,
+        "valid_urls": valid_urls,
+    }
+
+    job_key = f"batch:{job_id}"
+    if redis_available:
+        redis_client.set(job_key, serialize_job_data(job_data), ex=86400)
+    else:
+        job_storage[job_key] = job_data
+
+    background_tasks.add_task(batch_scrape_background_task, job_id, valid_urls, batch_request)
+
+    response = {
+        "success": True,
+        "id": job_id,
+        "url": valid_urls[0],
+        "invalidURLs": invalid_urls or None,
+    }
+    if idem_key:
+        _set_idempotent_response("v2:batch", idem_key, payload_hash, response)
+    return response
+
+
+@app.get("/v2/batch/scrape/{job_id}")
+async def v2_get_batch_status(job_id: str):
+    job_key = f"batch:{job_id}"
+    if redis_available:
+        job_data_str = redis_client.get(job_key)
+        if job_data_str:
+            job_data = deserialize_job_data(job_data_str.decode("utf-8"))
+        else:
+            job_data = None
+    else:
+        job_data = job_storage.get(job_key)
+
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Batch job not found")
+
+    expires_at = job_data.get("expires_at")
+    expires_at_str = expires_at.isoformat() if isinstance(expires_at, datetime) else expires_at
+    docs_in = job_data.get("data") or []
+    docs_out = [_v2_document_from_v1(d) for d in docs_in]
+
+    return {
+        "success": True,
+        "status": job_data.get("status"),
+        "completed": job_data.get("completed", 0),
+        "total": job_data.get("total", 0),
+        "creditsUsed": job_data.get("credits_used"),
+        "expiresAt": expires_at_str,
+        "next": job_data.get("next"),
+        "data": docs_out,
+    }
+
+
+@app.delete("/v2/batch/scrape/{job_id}")
+async def v2_cancel_batch(job_id: str):
+    _cancelled_batch_jobs.add(job_id)
+    job_key = f"batch:{job_id}"
+    if redis_available:
+        job_data_str = redis_client.get(job_key)
+        if job_data_str:
+            job_data = deserialize_job_data(job_data_str.decode("utf-8"))
+            job_data.update({"status": "cancelled"})
+            redis_client.set(job_key, serialize_job_data(job_data), ex=86400)
+    else:
+        job_data = job_storage.get(job_key)
+        if job_data:
+            job_data.update({"status": "cancelled"})
+            job_storage[job_key] = job_data
+    return {"status": "cancelled"}
+
+
+@app.get("/v2/batch/scrape/{job_id}/errors")
+async def v2_batch_errors(job_id: str):
+    return {"success": True, "data": {"errors": [], "robotsBlocked": []}}
+
+
+@app.post("/v2/search")
+@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+async def v2_search(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return {"success": False, "error": "Missing query"}
+    try:
+        limit = int(payload.get("limit") or 5)
+        if limit <= 0:
+            limit = 5
+        # Serper hard-limits are higher, but keep this conservative by default.
+        limit = min(limit, 20)
+        sources_in = payload.get("sources") or [{"type": "web"}]
+        sources: set[str] = set()
+        if isinstance(sources_in, list):
+            for s in sources_in:
+                if isinstance(s, str):
+                    sources.add(s)
+                elif isinstance(s, dict) and isinstance(s.get("type"), str):
+                    sources.add(s["type"])
+        if not sources:
+            sources = {"web"}
+
+        data: Dict[str, Any] = {"web": [], "news": [], "images": []}
+
+        gl = payload.get("country") or payload.get("gl")
+        hl = payload.get("lang") or payload.get("hl")
+        tbs = payload.get("tbs")
+
+        serper = SerperClient()
+
+        if "web" in sources:
+            res, _ = await serper.search(SerperSearchRequest(q=query, gl=gl, hl=hl, num=limit, tbs=tbs))
+            web_results: list[Dict[str, Any]] = []
+            if res.organic:
+                for r in res.organic[:limit]:
+                    if not r.link:
+                        continue
+                    web_results.append({"url": r.link, "title": r.title, "description": r.snippet})
+
+            scrape_opts_payload = payload.get("scrapeOptions") or {}
+            formats = scrape_opts_payload.get("formats") if isinstance(scrape_opts_payload, dict) else None
+            if isinstance(formats, list) and len(formats) > 0:
+                semaphore = asyncio.Semaphore(min(settings.max_concurrent_requests, 5))
+
+                async def scrape_one(u: str):
+                    async with semaphore:
+                        try:
+                            scrape_payload = {"url": u, **(scrape_opts_payload if isinstance(scrape_opts_payload, dict) else {})}
+                            return await _v2_scrape_data(u, scrape_payload)
+                        except Exception:
+                            return {"metadata": {"sourceURL": u, "statusCode": None}}
+
+                data["web"] = await asyncio.gather(*[scrape_one(r["url"]) for r in web_results])
+            else:
+                data["web"] = web_results
+
+        if "news" in sources:
+            news_res, _ = await serper.news(SerperNewsRequest(q=query, gl=gl, hl=hl, num=limit))
+            news_items = news_res.items[:limit] if isinstance(news_res.items, list) else []
+            out_news: list[Dict[str, Any]] = []
+            for idx, item in enumerate(news_items):
+                if not isinstance(item, dict):
+                    continue
+                out_news.append(
+                    _remove_empty_top_level(
+                        {
+                            "title": item.get("title"),
+                            "url": item.get("link") or item.get("url"),
+                            "snippet": item.get("snippet") or item.get("description"),
+                            "date": item.get("date"),
+                            "imageUrl": item.get("imageUrl") or item.get("image"),
+                            "position": item.get("position") or (idx + 1),
+                            "category": item.get("source") or item.get("category"),
+                        }
+                    )
+                )
+            data["news"] = out_news
+
+        if "images" in sources:
+            img_res, _ = await serper.images(SerperImageRequest(q=query, gl=gl, hl=hl, num=limit))
+            img_items = img_res.items[:limit] if isinstance(img_res.items, list) else []
+            out_images: list[Dict[str, Any]] = []
+            for idx, item in enumerate(img_items):
+                if not isinstance(item, dict):
+                    continue
+                out_images.append(
+                    _remove_empty_top_level(
+                        {
+                            "title": item.get("title"),
+                            "imageUrl": item.get("imageUrl") or item.get("image"),
+                            "imageWidth": item.get("imageWidth") or item.get("imageWidthPx") or item.get("width"),
+                            "imageHeight": item.get("imageHeight") or item.get("imageHeightPx") or item.get("height"),
+                            "url": item.get("link") or item.get("url"),
+                            "position": item.get("position") or (idx + 1),
+                        }
+                    )
+                )
+            data["images"] = out_images
+
+        return {"success": True, "data": data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/v2/extract")
+@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+async def v2_extract(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
+    urls = payload.get("urls")
+    if not isinstance(urls, list) or not urls:
+        return {"success": False, "error": "No URLs provided"}
+    try:
+        scrape_opts_payload = payload.get("scrapeOptions") or {}
+        options = _scrape_options_from_v2(scrape_opts_payload)
+        semaphore = asyncio.Semaphore(min(settings.max_concurrent_requests, 5))
+
+        async def scrape_one(u: str):
+            async with semaphore:
+                try:
+                    doc = await scraper.scrape_url(str(u), options)
+                    return _v2_document_from_v1(doc)
+                except Exception:
+                    return {"metadata": {"sourceURL": str(u), "statusCode": None}}
+
+        docs = await asyncio.gather(*[scrape_one(u) for u in urls])
+        return {"success": True, "status": "completed", "data": {"documents": docs}}
+    except Exception as e:
+        return {"success": False, "status": "failed", "error": str(e)}
+
+
 # --- Hermes endpoints ---
 
 @app.post("/v1/hermes/leads/search", response_model=HermesSearchResponse)
@@ -658,10 +1480,20 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
         
         # --- Crawler Setup ---
         options = crawl_request.scrape_options or ScrapeOptions(only_main_content=True)
+        ignore_query_parameters = bool(getattr(crawl_request, "ignore_query_parameters", False))
+        deduplicate_similar_urls = bool(getattr(crawl_request, "deduplicate_similar_urls", False))
+
+        def canon(u: str) -> str:
+            return _canonicalize_url(
+                u,
+                ignore_query_parameters=ignore_query_parameters,
+                deduplicate_similar_urls=deduplicate_similar_urls,
+            )
+
         frontier = MemoryFrontier()
         crawled_urls: set[str] = set()
         results: list[FirecrawlDocument] = []
-        start_parsed = urlparse(crawl_request.url)
+        start_parsed = urlparse(canon(crawl_request.url))
         base_domain = start_parsed.netloc
         start_job_time = time.time()
         total_bytes: int = 0
@@ -711,6 +1543,10 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
             return True
 
         async def enqueue(u: str, depth: int):
+            parsed = urlparse(u)
+            if parsed.scheme.lower() not in ["http", "https"] or not parsed.netloc:
+                return
+            u = canon(u)
             if u in crawled_urls:
                 return
             if not domain_allowed(u) or not path_allowed(u):
@@ -720,14 +1556,14 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
             await frontier.enqueue(u, depth)
 
         # Seed with start URL unconditionally (bypass path/domain filters)
-        await frontier.enqueue(crawl_request.url, 0)
+        await frontier.enqueue(canon(crawl_request.url), 0)
         # Seed with sitemap links if allowed
         if not crawl_request.ignore_sitemap:
             try:
                 sitemap_links = await get_sitemap_links(crawl_request.url)
                 for link in sitemap_links:
                     await enqueue(link, 0)
-                    if crawl_request.limit and (len(results) + queue.qsize()) >= crawl_request.limit:
+                    if crawl_request.limit and (len(results) + frontier.size()) >= crawl_request.limit:
                         break
             except Exception:
                 pass
@@ -738,16 +1574,17 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
         # --- Worker Definition ---
         async def worker(worker_id: int):
             while True:
+                url: str | None = None
+                rp: RobotFileParser | None = None
                 try:
                     url, depth = await frontier.dequeue()
+                    nonlocal total_bytes
 
                     if url in crawled_urls or (crawl_request.limit and len(results) >= crawl_request.limit):
-                        await frontier.mark_done(url)
                         continue
 
                     if depth > crawl_request.max_depth:
                         logger.info(f"Worker {worker_id}: Skipping {url}, max depth exceeded.")
-                        await frontier.mark_done(url)
                         continue
                     
                     # robots.txt check
@@ -756,11 +1593,10 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                         ua = (options.headers or {}).get("User-Agent") or settings.user_agent or "*"
                         if not rp.can_fetch(ua, url):
                             logger.info(f"Worker {worker_id}: Disallowed by robots.txt {url}")
-                            queue.task_done()
                             continue
                     except Exception:
                         # If robots cannot be fetched/parsed, proceed
-                        pass
+                        rp = None
 
                     # Per-host politeness (crawl-delay and concurrency=1 per host)
                     host = urlparse(url).netloc
@@ -768,17 +1604,24 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                         host_semaphores[host] = asyncio.Semaphore(1)
                         host_locks[host] = asyncio.Lock()
 
+                    # Budget/cancel checks before doing expensive work
+                    if job_id in _cancelled_jobs:
+                        break
+                    if crawl_request.max_time and (time.time() - start_job_time) > crawl_request.max_time:
+                        break
+                    if crawl_request.max_bytes and total_bytes >= crawl_request.max_bytes:
+                        break
+
                     crawled_urls.add(url)
                     logger.info(f"Worker {worker_id}: Crawling {url} at depth {depth}")
 
                     try:
-                        nonlocal total_bytes
                         # enforce crawl-delay if declared
                         try:
                             ua = (options.headers or {}).get("User-Agent") or settings.user_agent or "*"
                             delay_val = 0.0
                             try:
-                                delay_from_robots = rp.crawl_delay(ua) if 'rp' in locals() and rp else None
+                                delay_from_robots = rp.crawl_delay(ua) if rp else None
                             except Exception:
                                 delay_from_robots = None
                             if delay_from_robots:
@@ -820,8 +1663,9 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                             new_added = 0
                             for link in doc.links:
                                 parsed_link = urlparse(link)
-                                if parsed_link.scheme not in ['http', 'https']:
+                                if parsed_link.scheme.lower() not in ['http', 'https']:
                                     continue
+                                link = canon(link)
                                 if not domain_allowed(link) or not path_allowed(link):
                                     continue
                                 if link in crawled_urls or frontier.seen(link):
@@ -829,6 +1673,8 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                                 if crawl_request.limit and (len(results) + frontier.size()) >= crawl_request.limit:
                                     break
                                 if max_new is not None and new_added >= max_new:
+                                    break
+                                if job_id in _cancelled_jobs:
                                     break
                                 await frontier.enqueue(link, depth + 1)
                                 new_added += 1
@@ -855,7 +1701,7 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                 except asyncio.CancelledError:
                     break
                 finally:
-                    if 'url' in locals():
+                    if url is not None:
                         try:
                             await frontier.mark_done(url)
                         except Exception:
@@ -865,20 +1711,20 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
         workers = [asyncio.create_task(worker(i)) for i in range(concurrency)]
 
         # Wait for the queue to be fully processed with job-level budgets
+        final_status = "completed"
         while True:
-            try:
-                # emulate queue join with frontier size check
-                await asyncio.sleep(0.1)
-                if frontier.size() == 0 and frontier.inflight_size() == 0:
-                    break
-            except asyncio.TimeoutError:
-                # Check job-level budgets periodically
-                if crawl_request.max_time and (time.time() - start_job_time) > crawl_request.max_time:
-                    logger.info(f"Crawl job {job_id}: max_time reached")
-                    break
-                if crawl_request.max_bytes and total_bytes >= crawl_request.max_bytes:
-                    logger.info(f"Crawl job {job_id}: max_bytes reached")
-                    break
+            await asyncio.sleep(0.1)
+            if job_id in _cancelled_jobs:
+                final_status = "cancelled"
+                break
+            if crawl_request.max_time and (time.time() - start_job_time) > crawl_request.max_time:
+                job_data["warning"] = "max_time reached"
+                break
+            if crawl_request.max_bytes and total_bytes >= crawl_request.max_bytes:
+                job_data["warning"] = "max_bytes reached"
+                break
+            if frontier.size() == 0 and frontier.inflight_size() == 0:
+                break
 
         # Cancel all worker tasks
         for w in workers:
@@ -887,7 +1733,7 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
 
         # --- Finalize Job ---
         job_data.update({
-            "status": "completed",
+            "status": final_status,
             "completed": len(results),
             "total": len(crawled_urls), # Total unique URLs encountered
             "data": [doc.model_dump() for doc in results]
@@ -960,6 +1806,10 @@ async def batch_scrape_background_task(job_id: str, urls: List[str], batch_reque
             job_data = job_storage.get(job_key)
             if not job_data:
                 return  # Job not found
+
+        # Avoid overwriting a cancelled job with "completed".
+        if job_id in _cancelled_batch_jobs or job_data.get("status") == "cancelled":
+            return
         
         job_data.update({
             "status": "completed",

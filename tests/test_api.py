@@ -23,6 +23,28 @@ def test_scrape_success():
     assert "metadata" in data["data"]
     assert "Example Domain" in data["data"]["markdown"]
 
+def test_v2_scrape_actions_evaluate():
+    response = client.post(
+        "/v2/scrape",
+        json={
+            "url": "https://example.com",
+            "formats": ["markdown"],
+            "onlyMainContent": True,
+            "actions": [
+                {
+                    "type": "evaluate",
+                    "script": "document.body.insertAdjacentHTML('beforeend','<p>codex-action-test</p>');",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] == True
+    assert "data" in data
+    assert "markdown" in data["data"]
+    assert "codex-action-test" in data["data"]["markdown"]
+
 def test_scrape_missing_url():
     response = client.post("/v1/scrape", json={})
     assert response.status_code == 422

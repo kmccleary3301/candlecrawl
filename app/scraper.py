@@ -11,11 +11,11 @@ from loguru import logger
 from markdownify import markdownify as md
 from PIL import Image
 from pypdf import PdfReader
-from playwright.async_api import async_playwright, Browser
+from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
 
 from app.config import settings
 from app.http_client import ResilientHttpClient
-from app.models import FirecrawlDocument, DocumentMetadata, ScrapeOptions
+from app.models import FirecrawlDocument, DocumentMetadata, ScrapeOptions, ScrapeAction
 
 class ScrapingService:
     def __init__(self):
@@ -31,7 +31,12 @@ class ScrapingService:
     
     async def close_browser(self):
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception:
+                # Browser.close can fail during shutdown if the Playwright driver
+                # is already gone (e.g., Ctrl-C / abrupt termination).
+                pass
             self.browser = None
     
     async def scrape_url(self, url: str, options: ScrapeOptions = None) -> FirecrawlDocument:
@@ -56,6 +61,11 @@ class ScrapingService:
         except Exception as e:
             logger.error(f"Error scraping {url}: {str(e)}")
             # Fallback for sites that don't support HEAD requests
+            if isinstance(e, httpx.HTTPStatusError) and getattr(getattr(e, "response", None), "status_code", None) in {403, 405, 429}:
+                logger.warning(
+                    f"HEAD request blocked ({e.response.status_code}); escalating to browser/GET scrape for {url}"
+                )
+                return await self._scrape_html_page(url, options)
             if isinstance(e, httpx.UnsupportedProtocol) or "Method 'HEAD' not allowed" in str(e):
                 logger.warning(f"HEAD request failed for {url}, falling back to GET-based HTML scraping.")
                 return await self._scrape_html_page(url, options)
@@ -68,7 +78,8 @@ class ScrapingService:
         return (
             options.wait_for is not None or
             "screenshot" in (options.formats or []) or
-            options.mobile
+            options.mobile or
+            (options.actions is not None and len(options.actions) > 0)
         )
     
     async def _scrape_with_http(self, url: str, options: ScrapeOptions, timeout_override: Optional[int] = None) -> FirecrawlDocument:
@@ -102,10 +113,11 @@ class ScrapingService:
 
     async def _scrape_with_browser(self, url: str, options: ScrapeOptions) -> FirecrawlDocument:
         await self.initialize_browser()
+        use_actions = options.actions is not None and len(options.actions) > 0
+        viewport = {"width": 1920, "height": 1080} if use_actions else {"width": 1920, "height": 10000}
         context = await self.browser.new_context(
             user_agent=settings.user_agent,
-            # Set a massive viewport to trick the page into loading everything
-            viewport={"width": 1920, "height": 10000} 
+            viewport=viewport,
         )
         page = await context.new_page()
 
@@ -115,18 +127,47 @@ class ScrapingService:
             
             timeout = (options.timeout or settings.default_timeout) * 1000
             await page.goto(url, timeout=timeout * 2, wait_until="domcontentloaded")
-            
-            # Set zoom to 1% to force all elements into view
-            logger.info(f"Setting page zoom to 1% for {url}")
-            await page.evaluate("document.body.style.zoom = '0.01'")
 
-            # Wait for all network requests to complete after the initial load
-            logger.info(f"Waiting for network idle to ensure all content is loaded for {url}")
-            await page.wait_for_load_state('networkidle', timeout=30000) # 30-second timeout for idle
-            
-            # Add a final small delay for any post-idle rendering
-            await page.wait_for_timeout(3000)
+            # Best-effort: don't fail the scrape if the page never becomes "idle"
+            # (common for pages with long-polling / websockets).
+            try:
+                logger.info(f"Waiting for network idle to ensure all content is loaded for {url}")
+                await page.wait_for_load_state("networkidle", timeout=30000)  # 30-second timeout for idle
+            except PlaywrightTimeoutError:
+                logger.warning(f"Timed out waiting for network idle for {url}; continuing.")
 
+            if options.wait_for:
+                await page.wait_for_timeout(int(options.wait_for) * 1000)
+
+            if use_actions:
+                await self._apply_actions(page, options.actions, timeout_ms=int(timeout))
+
+            # If we're not doing interactive actions, use the aggressive "zoom out"
+            # heuristic to pull more lazy-loaded content into the viewport.
+            if not use_actions:
+                logger.info(f"Setting page zoom to 1% for {url}")
+                await page.evaluate("document.body.style.zoom = '0.01'")
+                # Give the page a moment to respond to the zoom/layout change.
+                await page.wait_for_timeout(500)
+                # Best-effort: trigger IntersectionObserver/in-view lazy loaders on long, JS-heavy pages
+                # (e.g., componentized SPAs) by sweeping scroll positions after zooming out.
+                try:
+                    scroll_height = await page.evaluate("document.body.scrollHeight")
+                    if isinstance(scroll_height, (int, float)) and scroll_height > 0:
+                        steps = 12
+                        for i in range(steps + 1):
+                            y = int((scroll_height * i) / steps)
+                            await page.evaluate("(y) => window.scrollTo(0, y)", y)
+                            await page.wait_for_timeout(200)
+                        await page.evaluate("window.scrollTo(0, 0)")
+                        await page.wait_for_timeout(200)
+                except Exception as e:
+                    logger.warning(f"Scroll sweep failed for {url}: {e}")
+
+            # Add a small delay for any post-action / post-idle rendering.
+            await page.wait_for_timeout(1000 if use_actions else 3000)
+
+            final_url = page.url or url
             html_content = await page.content()
             
             screenshot_data = None
@@ -134,7 +175,8 @@ class ScrapingService:
                 screenshot_bytes = await page.screenshot(full_page=True)
                 screenshot_data = base64.b64encode(screenshot_bytes).decode()
             
-            document = await self._process_html_content(url, html_content, 200, options)
+            document = await self._process_html_content(final_url, html_content, 200, options)
+            document.url = final_url
             
             if screenshot_data:
                 document.screenshot = screenshot_data
@@ -146,8 +188,29 @@ class ScrapingService:
     
     async def _scrape_html_page(self, url: str, options: ScrapeOptions) -> FirecrawlDocument:
         # This function contains the previous logic of trying httpx GET then falling back to browser
+        if self._needs_browser_rendering(options):
+            logger.info(f"Browser rendering required; scraping with browser for {url}")
+            return await self._scrape_with_browser(url, options)
         try:
             document = await self._scrape_with_http(url, options, timeout_override=10)
+            # Some JS-heavy sites return a "JavaScript required / unsupported browser" shell to non-browser fetches.
+            # Detect that and escalate to a real browser render even if the response is not "short".
+            raw = (getattr(document, "raw_html", None) or "") if document else ""
+            md_text = (document.markdown or "") if document else ""
+            js_stub_markers = [
+                "JavaScript is required",
+                "Please enable Javascript",
+                "Please enable JavaScript",
+                "we no longer support your browser",
+                "Apologies, we no longer support your browser",
+                "enable Javascript in order to use",
+                "enable JavaScript in order to use",
+            ]
+            if any(m.lower() in raw.lower() for m in js_stub_markers) or any(
+                m.lower() in md_text.lower() for m in js_stub_markers
+            ):
+                logger.info(f"Detected JS-required/unsupported-browser shell; escalating to browser for {url}")
+                return await self._scrape_with_browser(url, options)
             # If HTTP fetch produced some content, avoid escalating to a headless browser
             # for short, simple pages (e.g., example.com) to keep lightweight behavior
             # and reduce dependency on Playwright in constrained environments.
@@ -159,6 +222,79 @@ class ScrapingService:
         except Exception:
             logger.info(f"Initial HTTP GET failed, escalating to browser for {url}")
             return await self._scrape_with_browser(url, options)
+
+    async def _apply_actions(self, page: Page, actions: List[ScrapeAction], timeout_ms: int) -> None:
+        for idx, action in enumerate(actions):
+            if action is None:
+                continue
+
+            try:
+                action_type = (action.type or "").strip().lower()
+
+                if action_type in {"wait", "sleep"}:
+                    ms = action.milliseconds if action.milliseconds is not None else 1000
+                    await page.wait_for_timeout(int(ms))
+                    continue
+
+                if action_type in {"waitforselector", "wait_for_selector"}:
+                    if isinstance(action.selector, str) and action.selector.strip():
+                        await page.wait_for_selector(action.selector, timeout=timeout_ms)
+                    continue
+
+                if action_type == "click":
+                    if isinstance(action.selector, str) and action.selector.strip():
+                        await page.click(action.selector, timeout=timeout_ms)
+                    continue
+
+                if action_type in {"type", "fill", "write"}:
+                    if isinstance(action.selector, str) and action.selector.strip():
+                        text = action.text if isinstance(action.text, str) else ""
+                        await page.fill(action.selector, text, timeout=timeout_ms)
+                    continue
+
+                if action_type in {"press", "keypress"}:
+                    if isinstance(action.key, str) and action.key.strip():
+                        if isinstance(action.selector, str) and action.selector.strip():
+                            await page.press(action.selector, action.key, timeout=timeout_ms)
+                        else:
+                            await page.keyboard.press(action.key)
+                    continue
+
+                if action_type == "scroll":
+                    await self._scroll_page(page, action.direction, action.milliseconds)
+                    continue
+
+                if action_type in {"evaluate", "script", "executejavascript", "execute_javascript"}:
+                    script = action.script
+                    if isinstance(script, str) and script.strip():
+                        await page.evaluate(script)
+                    continue
+
+                if action_type in {"scrape", "screenshot", "generatepdf", "generate_pdf"}:
+                    # These are Firecrawl v2 action types. This server always performs a final scrape
+                    # at the end of /scrape, and supports screenshots via formats. PDF generation
+                    # isn't implemented yet, so treat these as no-ops for now.
+                    continue
+
+                logger.warning(f"Unknown action type '{action.type}' at index {idx}; ignoring.")
+            except Exception as e:
+                logger.warning(f"Action {idx} failed ({getattr(action, 'type', None)}): {e}")
+
+    async def _scroll_page(self, page: Page, direction: Optional[str], wait_ms: Optional[int]) -> None:
+        d = (direction or "down").strip().lower()
+        if d in {"top", "up"}:
+            await page.evaluate("window.scrollTo(0, 0)")
+        elif d in {"bottom", "down"}:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        elif d == "left":
+            await page.evaluate("window.scrollTo(0, window.scrollY)")
+        elif d == "right":
+            await page.evaluate("window.scrollTo(document.body.scrollWidth, window.scrollY)")
+        else:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+        if wait_ms is not None:
+            await page.wait_for_timeout(int(wait_ms))
 
     async def _get_file_metadata(self, url: str, headers: httpx.Headers, options: ScrapeOptions) -> FirecrawlDocument:
         content_type = headers.get('content-type', '').lower()
@@ -310,6 +446,11 @@ class ScrapingService:
 
         if options.remove_base64_images:
             soup = self._remove_base64_images(soup)
+
+        # Remove non-content tags that frequently pollute markdown output.
+        # (We still preserve the original `rawHtml` via `raw_html_soup` when requested.)
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
         
         # Absolutize links before final processing, unless instructed otherwise
         if not options.use_relative_links:

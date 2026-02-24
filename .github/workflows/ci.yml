@@ -30,6 +30,6 @@ jobs:
         run: |
           test -f contracts/openapi-v1.yaml
           grep -q "openapi:" contracts/openapi-v1.yaml
-          grep -q "/v1/scrape" contracts/openapi-v1.yaml
-          grep -q "/v1/map" contracts/openapi-v1.yaml
-          grep -q "/v1/crawl" contracts/openapi-v1.yaml
+          grep -q "/v2/scrape" contracts/openapi-v1.yaml
+          grep -q "/v2/map" contracts/openapi-v1.yaml
+          grep -q "/v2/crawl" contracts/openapi-v1.yaml

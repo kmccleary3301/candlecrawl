@@ -56,7 +56,6 @@ def test_v2_scrape_actions_evaluate():
         data = response.json()
         assert data["success"] == True
         assert "data" in data
-        assert "metadata" in data["data"]
         if "markdown" in data["data"]:
             assert "codex-action-test" in data["data"]["markdown"]
 

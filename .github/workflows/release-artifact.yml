@@ -1,0 +1,26 @@
+name: CandleCrawl Release Artifact
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          docker build -t candlecrawl:${GITHUB_REF_NAME} .
+      - name: Export image tarball
+        run: |
+          docker save candlecrawl:${GITHUB_REF_NAME} -o candlecrawl-${GITHUB_REF_NAME}.tar
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candlecrawl-image-${{ github.ref_name }}
+          path: candlecrawl-${{ github.ref_name }}.tar

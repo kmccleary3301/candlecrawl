@@ -1,0 +1,16 @@
+name: Bug report
+description: Report a reproducible bug
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true

@@ -1,0 +1,35 @@
+name: CandleCrawl CI
+
+on:
+  push:
+    branches: ["main", "release/**"]
+  pull_request:
+
+jobs:
+  unit-and-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Run unit/API tests
+        run: |
+          pytest -q tests/test_api.py tests/test_frontier.py tests/test_http_client.py tests/test_crawl_policies.py tests/test_crawl_extreme.py
+
+  contract-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate contract artifact exists and contains required paths
+        run: |
+          test -f contracts/openapi-v1.yaml
+          grep -q "openapi:" contracts/openapi-v1.yaml
+          grep -q "/v1/scrape" contracts/openapi-v1.yaml
+          grep -q "/v1/map" contracts/openapi-v1.yaml
+          grep -q "/v1/crawl" contracts/openapi-v1.yaml

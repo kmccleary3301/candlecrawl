@@ -1,0 +1,480 @@
+openapi: 3.1.0
+info:
+  title: CandleCrawl API (Draft Contract v1)
+  version: 0.1.0-draft
+  description: |
+    Draft internal contract used for Hermes/CandleCrawl separation.
+    This is a behavior contract draft, not final public API documentation.
+servers:
+  - url: http://localhost:3010
+    description: Local CandleCrawl service
+
+tags:
+  - name: scrape
+  - name: crawl
+  - name: search
+  - name: map
+  - name: extract
+
+paths:
+  /v2/scrape:
+    post:
+      tags: [scrape]
+      summary: Scrape a single URL
+      operationId: scrapeV2
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XAuditId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScrapeRequest'
+      responses:
+        '200':
+          description: Scrape success
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-Audit-Id:
+              $ref: '#/components/headers/XAuditId'
+            X-Contract-Version:
+              $ref: '#/components/headers/XContractVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScrapeResponse'
+        '4XX':
+          $ref: '#/components/responses/ErrorResponse'
+        '5XX':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /v2/search:
+    post:
+      tags: [search]
+      summary: Run provider-backed web search
+      operationId: searchV2
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XAuditId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequest'
+      responses:
+        '200':
+          description: Search success
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-Audit-Id:
+              $ref: '#/components/headers/XAuditId'
+            X-Contract-Version:
+              $ref: '#/components/headers/XContractVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '4XX':
+          $ref: '#/components/responses/ErrorResponse'
+        '5XX':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /v2/map:
+    post:
+      tags: [map]
+      summary: Discover URLs for a root URL
+      operationId: mapV2
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XAuditId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MapRequest'
+      responses:
+        '200':
+          description: Map success
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-Audit-Id:
+              $ref: '#/components/headers/XAuditId'
+            X-Contract-Version:
+              $ref: '#/components/headers/XContractVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MapResponse'
+        '4XX':
+          $ref: '#/components/responses/ErrorResponse'
+        '5XX':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /v2/crawl:
+    post:
+      tags: [crawl]
+      summary: Start async crawl job
+      operationId: createCrawlJobV2
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XAuditId'
+        - $ref: '#/components/parameters/XIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrawlRequest'
+      responses:
+        '200':
+          description: Crawl accepted
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-Audit-Id:
+              $ref: '#/components/headers/XAuditId'
+            X-Contract-Version:
+              $ref: '#/components/headers/XContractVersion'
+            X-Candlecrawl-Job-Id:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CrawlCreateResponse'
+        '409':
+          description: Idempotency key reuse with mismatched payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '4XX':
+          $ref: '#/components/responses/ErrorResponse'
+        '5XX':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /v2/crawl/{job_id}:
+    get:
+      tags: [crawl]
+      summary: Get crawl job status
+      operationId: getCrawlJobV2
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XAuditId'
+      responses:
+        '200':
+          description: Crawl status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CrawlStatusResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '4XX':
+          $ref: '#/components/responses/ErrorResponse'
+        '5XX':
+          $ref: '#/components/responses/ErrorResponse'
+
+    delete:
+      tags: [crawl]
+      summary: Cancel crawl job
+      operationId: cancelCrawlJobV2
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XAuditId'
+      responses:
+        '200':
+          description: Job cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '4XX':
+          $ref: '#/components/responses/ErrorResponse'
+        '5XX':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /v2/extract:
+    post:
+      tags: [extract]
+      summary: Extract structured data from URL content
+      operationId: extractV2
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XAuditId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtractRequest'
+      responses:
+        '200':
+          description: Extract success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtractResponse'
+        '4XX':
+          $ref: '#/components/responses/ErrorResponse'
+        '5XX':
+          $ref: '#/components/responses/ErrorResponse'
+
+components:
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema:
+        type: string
+    XAuditId:
+      name: X-Audit-Id
+      in: header
+      required: false
+      schema:
+        type: string
+    XIdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+
+  headers:
+    XRequestId:
+      schema:
+        type: string
+    XAuditId:
+      schema:
+        type: string
+    XContractVersion:
+      schema:
+        type: string
+        example: candlecrawl.web.v1
+
+  responses:
+    ErrorResponse:
+      description: Structured error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          additionalProperties: true
+
+    ErrorEnvelope:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: object
+          required: [code, message, retryable, http_status]
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_REQUEST
+                - INVALID_URL
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - RATE_LIMITED
+                - ROBOTS_DISALLOWED
+                - CAPTCHA_DETECTED
+                - UPSTREAM_TIMEOUT
+                - UPSTREAM_BLOCKED
+                - UPSTREAM_ERROR
+                - PARSER_ERROR
+                - JOB_NOT_FOUND
+                - JOB_CANCELLED
+                - INTERNAL_ERROR
+            message:
+              type: string
+            retryable:
+              type: boolean
+            http_status:
+              type: integer
+            details:
+              type: object
+              additionalProperties: true
+
+    Provenance:
+      type: object
+      properties:
+        caller:
+          type: string
+        survey_id:
+          type: string
+        run_id:
+          type: string
+
+    ScrapeRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+        formats:
+          type: array
+          items:
+            type: string
+        options:
+          type: object
+          additionalProperties: true
+        artifact_mode:
+          type: string
+          enum: [inline, querylake_files]
+        provenance:
+          $ref: '#/components/schemas/Provenance'
+
+    ScrapeResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+
+    SearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+        provider:
+          type: string
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        filters:
+          type: object
+          additionalProperties: true
+        provenance:
+          $ref: '#/components/schemas/Provenance'
+
+    SearchResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+
+    MapRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+        max_urls:
+          type: integer
+          minimum: 1
+        include_paths:
+          type: array
+          items:
+            type: string
+        exclude_paths:
+          type: array
+          items:
+            type: string
+
+    MapResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+
+    CrawlRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+        include_paths:
+          type: array
+          items:
+            type: string
+        exclude_paths:
+          type: array
+          items:
+            type: string
+        max_depth:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+          minimum: 1
+        allow_external_links:
+          type: boolean
+        include_subdomains:
+          type: boolean
+        delay_ms:
+          type: integer
+          minimum: 0
+        max_concurrency:
+          type: integer
+          minimum: 1
+        scrape_options:
+          type: object
+          additionalProperties: true
+        webhook:
+          type: object
+          properties:
+            url:
+              type: string
+              format: uri
+            secret_ref:
+              type: string
+        provenance:
+          $ref: '#/components/schemas/Provenance'
+
+    CrawlCreateResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+
+    CrawlStatusResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+
+    ExtractRequest:
+      type: object
+      required: [urls]
+      properties:
+        urls:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uri
+        prompt:
+          type: string
+        schema:
+          type: object
+          additionalProperties: true
+
+    ExtractResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'

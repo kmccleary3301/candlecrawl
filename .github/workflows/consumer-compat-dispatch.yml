@@ -1,0 +1,44 @@
+name: CandleCrawl Consumer Compatibility Dispatch
+
+on:
+  push:
+    branches: ["main"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  dispatch-hermes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to Hermes consumer repo when configured
+        env:
+          TARGET_REPO: ${{ vars.HERMES_CONSUMER_REPO }}
+          TOKEN: ${{ secrets.HERMES_REPO_DISPATCH_TOKEN }}
+          EVENT_TYPE: candlecrawl_contract_candidate
+        run: |
+          if [ -z "${TARGET_REPO}" ] || [ -z "${TOKEN}" ]; then
+            echo "Dispatch skipped: HERMES_CONSUMER_REPO var or HERMES_REPO_DISPATCH_TOKEN secret is not configured"
+            exit 0
+          fi
+
+          payload=$(cat <<JSON
+          {
+            "event_type": "${EVENT_TYPE}",
+            "client_payload": {
+              "producer_repo": "${GITHUB_REPOSITORY}",
+              "producer_sha": "${GITHUB_SHA}",
+              "producer_ref": "${GITHUB_REF}",
+              "producer_run_id": "${GITHUB_RUN_ID}"
+            }
+          }
+          JSON
+          )
+
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${TARGET_REPO}/dispatches" \
+            -d "${payload}"
+          echo "Dispatched consumer compatibility event to ${TARGET_REPO}"

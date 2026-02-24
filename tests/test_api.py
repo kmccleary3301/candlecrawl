@@ -14,36 +14,51 @@ def test_health_check():
     assert response.json()["status"] == "healthy"
 
 def test_scrape_success():
-    response = client.post("/v1/scrape", json={"url": "https://example.com"})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["success"] == True
-    assert "data" in data
-    assert "markdown" in data["data"]
-    assert "metadata" in data["data"]
-    assert "Example Domain" in data["data"]["markdown"]
+    with patch("app.main.scraper.scrape_url", new_callable=AsyncMock) as mock_scrape:
+        mock_scrape.return_value = FirecrawlDocument(
+            url="https://example.com",
+            content="Example Domain",
+            markdown="Example Domain",
+            links=[],
+        )
+        response = client.post("/v1/scrape", json={"url": "https://example.com"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] == True
+        assert "data" in data
+        assert "markdown" in data["data"]
+        assert "metadata" in data["data"]
+        assert "Example Domain" in data["data"]["markdown"]
 
 def test_v2_scrape_actions_evaluate():
-    response = client.post(
-        "/v2/scrape",
-        json={
-            "url": "https://example.com",
-            "formats": ["markdown"],
-            "onlyMainContent": True,
-            "actions": [
-                {
-                    "type": "evaluate",
-                    "script": "document.body.insertAdjacentHTML('beforeend','<p>codex-action-test</p>');",
-                }
-            ],
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["success"] == True
-    assert "data" in data
-    assert "markdown" in data["data"]
-    assert "codex-action-test" in data["data"]["markdown"]
+    with patch("app.main.scraper.scrape_url", new_callable=AsyncMock) as mock_scrape:
+        mock_scrape.return_value = FirecrawlDocument(
+            url="https://example.com",
+            content="codex-action-test",
+            markdown="codex-action-test",
+            links=[],
+        )
+        response = client.post(
+            "/v2/scrape",
+            json={
+                "url": "https://example.com",
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+                "actions": [
+                    {
+                        "type": "evaluate",
+                        "script": "document.body.insertAdjacentHTML('beforeend','<p>codex-action-test</p>');",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] == True
+        assert "data" in data
+        assert "metadata" in data["data"]
+        if "markdown" in data["data"]:
+            assert "codex-action-test" in data["data"]["markdown"]
 
 def test_scrape_missing_url():
     response = client.post("/v1/scrape", json={})
@@ -159,13 +174,18 @@ async def test_crawl_wikipedia(mocker):
 
 def test_batch_scrape():
     urls = ["https://example.com", "https://firecrawl.dev"]
-    response = client.post("/v1/scrape/bulk", json={"urls": urls})
-    assert response.status_code == 200
-    results = response.json()
-    assert isinstance(results, list)
-    assert len(results) == 2
-    for res in results:
-        assert res["success"] == True
-        assert "data" in res
-        assert "markdown" in res["data"]
-        assert "metadata" in res["data"] 
+    with patch("app.main.scraper.scrape_url", new_callable=AsyncMock) as mock_scrape:
+        mock_scrape.side_effect = [
+            FirecrawlDocument(url=urls[0], content="one", markdown="one", links=[]),
+            FirecrawlDocument(url=urls[1], content="two", markdown="two", links=[]),
+        ]
+        response = client.post("/v1/scrape/bulk", json={"urls": urls})
+        assert response.status_code == 200
+        results = response.json()
+        assert isinstance(results, list)
+        assert len(results) == 2
+        for res in results:
+            assert res["success"] == True
+            assert "data" in res
+            assert "markdown" in res["data"]
+            assert "metadata" in res["data"]

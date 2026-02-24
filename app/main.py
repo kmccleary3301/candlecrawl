@@ -38,7 +38,6 @@ from app.frontier import MemoryFrontier
 from app.providers.serper import SerperClient, SerperImageRequest, SerperNewsRequest, SerperSearchRequest
 from app.providers.openrouter import OpenRouterClient, OpenRouterChatRequest, ORMessage
 from app.providers.scrapedo import ScrapeDoClient, ScrapeDoRequest
-from app.hermes_bcas import HermesBStar04
 from app.cost_endpoints import router as cost_router
 
 @asynccontextmanager
@@ -1401,6 +1400,9 @@ async def hermes_enrich(req: HermesEnrichRequest):
 @app.post("/v1/hermes/research")
 async def hermes_research(body: dict):
     try:
+        # Keep Hermes compatibility path optional in standalone CandleCrawl.
+        from app.hermes_bcas import HermesBStar04
+
         question = body.get("question") or body.get("query")
         max_searches = int(body.get("max_searches", 3))
         model = body.get("model", "openai/gpt-5-nano")

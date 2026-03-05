@@ -1,10 +1,11 @@
 import json
-import pytest
-import httpx
 
-from app.providers.serper import SerperClient, SerperSearchRequest
+import httpx
+import pytest
+
+from app.providers.openrouter import OpenRouterChatRequest, OpenRouterClient, ORMessage
 from app.providers.scrapedo import ScrapeDoClient, ScrapeDoRequest
-from app.providers.openrouter import OpenRouterClient, OpenRouterChatRequest, ORMessage
+from app.providers.serper import SerperClient, SerperSearchRequest
 
 
 @pytest.mark.asyncio

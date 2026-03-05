@@ -1,7 +1,9 @@
 import asyncio
 import random
 from typing import Optional
+
 import httpx
+
 from app.config import settings
 
 
@@ -30,7 +32,6 @@ class ResilientHttpClient:
 
     async def get(self, url: str, *, headers: Optional[dict] = None) -> httpx.Response:
         attempts = settings.retry_max_attempts
-        last_exc: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=self.follow_redirects) as client:
             for attempt in range(1, attempts + 1):
                 resp: Optional[httpx.Response] = None
@@ -48,14 +49,12 @@ class ResilientHttpClient:
                         raise httpx.HTTPStatusError("retryable status", request=resp.request, response=resp)
                     return resp
                 except Exception as e:
-                    last_exc = e
                     if attempt >= attempts or not self._should_retry(e, resp):
                         raise
                     await asyncio.sleep(self._compute_backoff(attempt))
 
     async def head(self, url: str, *, headers: Optional[dict] = None) -> httpx.Response:
         attempts = settings.retry_max_attempts
-        last_exc: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=self.follow_redirects) as client:
             for attempt in range(1, attempts + 1):
                 resp: Optional[httpx.Response] = None
@@ -72,7 +71,6 @@ class ResilientHttpClient:
                         raise httpx.HTTPStatusError("retryable status", request=resp.request, response=resp)
                     return resp
                 except Exception as e:
-                    last_exc = e
                     if attempt >= attempts or not self._should_retry(e, resp):
                         raise
                     await asyncio.sleep(self._compute_backoff(attempt))

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Tuple
 
-
 # Per-million token pricing (USD): (input_per_million, output_per_million)
 # These are reasonable defaults based on public guidance and internal usage; adjust as needed.
 MODEL_PRICE_PER_MILLION = {

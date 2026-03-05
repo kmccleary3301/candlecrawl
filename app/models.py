@@ -1,6 +1,8 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any, Literal, Union
 from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Dict, List, Literal, Optional, Union
+
+from pydantic import BaseModel, Field
 
 
 def utc_now() -> datetime:
@@ -13,7 +15,7 @@ class LocationConfig(BaseModel):
     country: Optional[str] = None
     languages: Optional[List[str]] = None
 
-# Webhook configuration  
+# Webhook configuration
 class WebhookConfig(BaseModel):
     url: str
     headers: Optional[Dict[str, str]] = None
@@ -46,7 +48,7 @@ class ScrapeOptions(BaseModel):
     use_relative_links: Optional[bool] = False
     include_file_body: Optional[bool] = False
     actions: Optional[List[ScrapeAction]] = None
-    
+
 # Document metadata
 class DocumentMetadata(BaseModel):
     title: Optional[str] = None
@@ -58,7 +60,7 @@ class DocumentMetadata(BaseModel):
     file_metadata: Optional[Dict[str, Any]] = None
     blocked: Optional[bool] = None
     blocked_reason: Optional[Literal["captcha","ip_block","robots_disallow","rate_limited"]] = None
-    
+
 # Firecrawl document
 class FirecrawlDocument(BaseModel):
     url: Optional[str] = None
@@ -234,12 +236,10 @@ class HermesEnrichResponse(BaseModel):
     details: Optional[Dict[str, Any]] = None
 
 # Contact Extraction System Models
-from enum import Enum
-
 class SocialMediaPlatform(str, Enum):
     """Supported social media platforms for extraction"""
     FACEBOOK = "facebook"
-    LINKEDIN = "linkedin" 
+    LINKEDIN = "linkedin"
     TWITTER = "twitter"
     YOUTUBE = "youtube"
     INSTAGRAM = "instagram"
@@ -252,44 +252,44 @@ class SocialMediaConfig(BaseModel):
     # If True, extract any relevant social media found
     # If dict, extract only specified platforms
     platforms: Union[bool, Dict[SocialMediaPlatform, bool]] = True
-    
+
     # Whether to extract follower counts, verification status, etc.
     include_metrics: bool = False
-    
+
     # Whether to extract recent posts or activity indicators
     include_activity: bool = False
 
 class ContactExtractionConfig(BaseModel):
     """Configuration for contact information extraction"""
-    
+
     # Basic contact information
     phone_numbers: bool = Field(default=True, description="Extract phone numbers")
     emails: bool = Field(default=True, description="Extract email addresses")
     addresses: bool = Field(default=True, description="Extract physical addresses")
     websites: bool = Field(default=True, description="Extract website URLs")
-    
+
     # Social media configuration
     social_media: Union[bool, SocialMediaConfig] = Field(
-        default=True, 
+        default=True,
         description="Extract social media profiles - boolean for all, or SocialMediaConfig for specific"
     )
-    
+
     # Personnel information
     key_personnel: bool = Field(default=True, description="Extract key personnel contact info")
     departments: bool = Field(default=False, description="Extract department-specific contacts")
-    
+
     # Business-specific information
     business_hours: bool = Field(default=False, description="Extract business hours")
     locations: bool = Field(default=False, description="Extract multiple location details")
-    
+
     # Verification requirements
     require_verification: bool = Field(
-        default=False, 
+        default=False,
         description="Only include contact info that can be verified from sources"
     )
-    
+
     # Output formatting
     include_context: bool = Field(
-        default=True, 
+        default=True,
         description="Include context about where/how contact info was found"
     )

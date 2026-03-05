@@ -1,32 +1,33 @@
-import pytest
-from fastapi.testclient import TestClient
-from app.main import app
 import asyncio
 import time
 from unittest.mock import AsyncMock
+
+import pytest
+
 from app.models import FirecrawlDocument
 
-client = TestClient(app)
 
 @pytest.mark.asyncio
-async def test_crawl_include_exclude_paths(mocker):
+async def test_crawl_include_exclude_paths(client, mocker):
     base = "https://example.com"
-    # Mock scraping: root has 3 links
-    mock_scrape = mocker.patch('app.main.scraper.scrape_url', new_callable=AsyncMock)
+    mock_scrape = mocker.patch("app.service.scraper.scrape_url", new_callable=AsyncMock)
     mock_scrape.side_effect = [
         FirecrawlDocument(url=f"{base}", links=[f"{base}/allowed/a", f"{base}/blocked/b", f"{base}/allowed/c"]),
         FirecrawlDocument(url=f"{base}/allowed/a"),
         FirecrawlDocument(url=f"{base}/allowed/c"),
     ]
 
-    resp = client.post("/v1/crawl", json={
-        "url": base,
-        "limit": 10,
-        "max_depth": 2,
-        "include_paths": ["/allowed"],
-        "exclude_paths": ["/blocked"],
-        "max_concurrency": 2
-    })
+    resp = client.post(
+        "/v1/crawl",
+        json={
+            "url": base,
+            "limit": 10,
+            "max_depth": 2,
+            "include_paths": ["/allowed"],
+            "exclude_paths": ["/blocked"],
+            "max_concurrency": 2,
+        },
+    )
     assert resp.status_code == 200
     job_id = resp.json()["id"]
 
@@ -44,11 +45,11 @@ async def test_crawl_include_exclude_paths(mocker):
         await asyncio.sleep(0.2)
     assert False, "timeout"
 
+
 @pytest.mark.asyncio
-async def test_crawl_budget_limits(mocker):
+async def test_crawl_budget_limits(client, mocker):
     base = "https://example.org"
-    mock_scrape = mocker.patch('app.main.scraper.scrape_url', new_callable=AsyncMock)
-    # Make each page heavy to hit max_bytes quickly
+    mock_scrape = mocker.patch("app.service.scraper.scrape_url", new_callable=AsyncMock)
     heavy_md = "x" * 1024 * 64
     mock_scrape.side_effect = [
         FirecrawlDocument(url=f"{base}", markdown=heavy_md, links=[f"{base}/p1", f"{base}/p2", f"{base}/p3"]),
@@ -57,13 +58,16 @@ async def test_crawl_budget_limits(mocker):
         FirecrawlDocument(url=f"{base}/p3", markdown=heavy_md),
     ]
 
-    resp = client.post("/v1/crawl", json={
-        "url": base,
-        "limit": 100,
-        "max_depth": 2,
-        "max_concurrency": 3,
-        "max_bytes": 128 * 1024  # stop around 2 heavy pages
-    })
+    resp = client.post(
+        "/v1/crawl",
+        json={
+            "url": base,
+            "limit": 100,
+            "max_depth": 2,
+            "max_concurrency": 3,
+            "max_bytes": 128 * 1024,
+        },
+    )
     assert resp.status_code == 200
     job_id = resp.json()["id"]
 
@@ -73,12 +77,7 @@ async def test_crawl_budget_limits(mocker):
         assert s.status_code == 200
         data = s.json()
         if data["status"] == "completed":
-            # Should have cut off early due to max_bytes
             assert len(data["data"]) <= 3
             return
         await asyncio.sleep(0.2)
     assert False, "timeout"
-
-
-
-

@@ -1,4 +1,4 @@
-# FastAPI Firecrawl Implementation
+# CandleCrawl application package
 
 __all__ = [
     "config",
@@ -9,4 +9,5 @@ __all__ = [
     "metrics",
     "models",
     "scraper",
+    "service",
 ]

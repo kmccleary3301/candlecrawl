@@ -1,6 +1,8 @@
-import pytest
-import httpx
 from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+
 from app.http_client import ResilientHttpClient
 
 

@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
-import asyncio
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.cost_tracking import (
-    JobCostTracker, 
-    get_cost_tracker, 
-    get_active_trackers,
+    TierBudgetConfig,
     cleanup_completed_trackers,
-    TierBudgetConfig
+    get_active_trackers,
+    get_cost_tracker,
 )
+from app.framework_shims import APIRouter, HTTPException, Query
 
 router = APIRouter(prefix="/v1/hermes/costs", tags=["cost-tracking"])
 
@@ -23,7 +21,7 @@ class CostSummaryResponse(BaseModel):
     total_jobs: int
     total_cost: float
     avg_cost_per_job: float
-    
+
     # Breakdown by tier
     broadcast_jobs: int = 0
     broadcast_cost: float = 0.0
@@ -31,17 +29,17 @@ class CostSummaryResponse(BaseModel):
     targeted_cost: float = 0.0
     precision_jobs: int = 0
     precision_cost: float = 0.0
-    
+
     # Provider breakdown
     openrouter_cost: float = 0.0
     serper_cost: float = 0.0
     scrapedo_cost: float = 0.0
     firecrawl_cost: float = 0.0
-    
+
     # Performance metrics
     avg_duration_seconds: Optional[float] = None
     avg_efficiency_rating: str = "unknown"
-    
+
     period_start: datetime
     period_end: datetime
 
@@ -53,17 +51,17 @@ class JobCostResponse(BaseModel):
     started_at: datetime
     completed_at: Optional[datetime]
     duration_seconds: Optional[float]
-    
+
     # Cost breakdown
     total_cost: float
     cost_breakdown: Dict[str, float]
     stage_costs: Dict[str, float]
-    
+
     # Usage summary
     usage_summary: Dict[str, int]
     efficiency_rating: str
     within_budget: bool
-    
+
     # Performance indicators
     cost_per_token: Optional[float] = None
     cost_per_search: Optional[float] = None
@@ -102,7 +100,7 @@ async def get_job_costs(job_id: str, include_trace: bool = Query(default=False))
     tracker = get_cost_tracker(job_id)
     if not tracker:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    
+
     return JobCostResponse(
         job_id=tracker.job_id,
         tier=tracker.tier,
@@ -127,11 +125,11 @@ async def get_cost_summary(
     tier: Optional[str] = Query(default=None, description="Filter by specific tier")
 ):
     """Get cost summary across all jobs for specified period"""
-    
+
     # Get active trackers for recent data
     active_trackers = get_active_trackers()
     completed_trackers = {k: v for k, v in active_trackers.items() if v.completed_at is not None}
-    
+
     # Calculate summary metrics
     total_jobs = len(completed_trackers)
     if total_jobs == 0:
@@ -144,42 +142,42 @@ async def get_cost_summary(
             period_start=period_start,
             period_end=period_end
         )
-    
+
     # Filter by tier if specified
     if tier:
-        completed_trackers = {k: v for k, v in completed_trackers.items() 
+        completed_trackers = {k: v for k, v in completed_trackers.items()
                             if v.tier and v.tier.upper() == tier.upper()}
         total_jobs = len(completed_trackers)
-    
+
     # Aggregate data
     total_cost = sum(t.total_cost for t in completed_trackers.values())
     avg_cost = total_cost / total_jobs if total_jobs > 0 else 0
-    
+
     # Tier breakdown
     broadcast_trackers = [t for t in completed_trackers.values() if t.tier == "BROADCAST"]
-    targeted_trackers = [t for t in completed_trackers.values() if t.tier == "TARGETED"]  
+    targeted_trackers = [t for t in completed_trackers.values() if t.tier == "TARGETED"]
     precision_trackers = [t for t in completed_trackers.values() if t.tier == "PRECISION"]
-    
+
     # Provider costs
     openrouter_cost = sum(t.openrouter_cost for t in completed_trackers.values())
     serper_cost = sum(t.serper_cost for t in completed_trackers.values())
     scrapedo_cost = sum(t.scrapedo_cost for t in completed_trackers.values())
     firecrawl_cost = sum(t.firecrawl_cost for t in completed_trackers.values())
-    
+
     # Performance metrics
     durations = [t.get_duration() for t in completed_trackers.values() if t.get_duration()]
     avg_duration = sum(durations) / len(durations) if durations else None
-    
+
     # Efficiency rating (most common)
     ratings = [t.get_tier_efficiency_rating() for t in completed_trackers.values()]
     rating_counts = {}
     for rating in ratings:
         rating_counts[rating] = rating_counts.get(rating, 0) + 1
     avg_efficiency_rating = max(rating_counts.items(), key=lambda x: x[1])[0] if rating_counts else "unknown"
-    
+
     period_start = datetime.now() - timedelta(days=days)
     period_end = datetime.now()
-    
+
     return CostSummaryResponse(
         total_jobs=total_jobs,
         total_cost=total_cost,
@@ -204,13 +202,13 @@ async def get_cost_summary(
 @router.get("/providers", response_model=List[ProviderStatsResponse])
 async def get_provider_costs():
     """Get current cost breakdown by provider"""
-    
+
     # Get active and completed trackers
     all_trackers = get_active_trackers()
-    
+
     providers = ["openrouter", "serper", "scrapedo", "firecrawl"]
     stats = []
-    
+
     for provider in providers:
         if provider == "openrouter":
             total_calls = sum(t.openrouter_calls for t in all_trackers.values())
@@ -218,7 +216,7 @@ async def get_provider_costs():
             successful_calls = total_calls  # Assume all successful if tracker exists
             failed_calls = 0
         elif provider == "serper":
-            total_calls = sum(t.serper_calls for t in all_trackers.values()) 
+            total_calls = sum(t.serper_calls for t in all_trackers.values())
             total_cost = sum(t.serper_cost for t in all_trackers.values())
             successful_calls = total_calls
             failed_calls = 0
@@ -232,10 +230,10 @@ async def get_provider_costs():
             total_cost = sum(t.firecrawl_cost for t in all_trackers.values())
             successful_calls = total_calls
             failed_calls = 0
-        
+
         success_rate = (successful_calls / total_calls * 100) if total_calls > 0 else 0
         avg_cost_per_call = total_cost / total_calls if total_calls > 0 else 0
-        
+
         stats.append(ProviderStatsResponse(
             provider=provider,
             total_calls=total_calls,
@@ -245,16 +243,16 @@ async def get_provider_costs():
             total_cost=total_cost,
             avg_cost_per_call=avg_cost_per_call
         ))
-    
+
     return stats
 
 
 @router.get("/active", response_model=List[JobCostResponse])
 async def get_active_jobs():
     """Get all currently active (running) research jobs"""
-    
+
     active_trackers = {k: v for k, v in get_active_trackers().items() if v.completed_at is None}
-    
+
     jobs = []
     for tracker in active_trackers.values():
         jobs.append(JobCostResponse(
@@ -272,7 +270,7 @@ async def get_active_jobs():
             cost_per_token=tracker.total_cost / max(tracker.openrouter_tokens, 1) if tracker.openrouter_tokens > 0 else None,
             cost_per_search=tracker.total_cost / max(tracker.serper_calls, 1) if tracker.serper_calls > 0 else None
         ))
-    
+
     return jobs
 
 
@@ -292,20 +290,20 @@ async def update_budget_config(config: TierBudgetConfig):
 @router.get("/alerts", response_model=List[BudgetAlertResponse])
 async def get_budget_alerts():
     """Get recent budget alerts"""
-    
+
     # Check current active jobs for budget alerts
     active_trackers = {k: v for k, v in get_active_trackers().items() if v.completed_at is None}
     alerts = []
-    
+
     budget_config = TierBudgetConfig()
-    
+
     for tracker in active_trackers.values():
         if tracker.tier:
             alert_level = budget_config.get_alert_level(tracker.tier, tracker.total_cost)
             if alert_level != "normal":
                 budget_limit = budget_config.get_limit(tracker.tier)
                 percentage = (tracker.total_cost / budget_limit * 100) if budget_limit > 0 else 0
-                
+
                 alerts.append(BudgetAlertResponse(
                     job_id=tracker.job_id,
                     tier=tracker.tier,
@@ -316,7 +314,7 @@ async def get_budget_alerts():
                     message=f"Job {tracker.job_id} ({tracker.tier}) at {percentage:.1f}% of budget: ${tracker.total_cost:.6f} / ${budget_limit:.6f}",
                     created_at=datetime.now()
                 ))
-    
+
     return alerts
 
 
@@ -331,41 +329,41 @@ async def cleanup_old_trackers(max_age_hours: int = Query(default=24, descriptio
 @router.get("/efficiency/tier/{tier}")
 async def get_tier_efficiency_analysis(tier: str):
     """Get efficiency analysis for a specific tier"""
-    
+
     tier = tier.upper()
     if tier not in ["BROADCAST", "TARGETED", "PRECISION"]:
         raise HTTPException(status_code=400, detail="Invalid tier. Must be BROADCAST, TARGETED, or PRECISION")
-    
+
     # Get completed trackers for the tier
     all_trackers = get_active_trackers()
-    tier_trackers = [t for t in all_trackers.values() 
+    tier_trackers = [t for t in all_trackers.values()
                     if t.completed_at and t.tier and t.tier.upper() == tier]
-    
+
     if not tier_trackers:
         return {
             "tier": tier,
             "sample_size": 0,
             "analysis": "No completed jobs found for this tier"
         }
-    
+
     # Calculate efficiency metrics
     costs = [t.total_cost for t in tier_trackers]
     durations = [t.get_duration() for t in tier_trackers if t.get_duration()]
-    
+
     efficiency_ratings = {}
     for tracker in tier_trackers:
         rating = tracker.get_tier_efficiency_rating()
         efficiency_ratings[rating] = efficiency_ratings.get(rating, 0) + 1
-    
+
     # Expected cost ranges
     expected_ranges = {
         "BROADCAST": (0.002, 0.008),
         "TARGETED": (0.005, 0.025),
         "PRECISION": (0.020, 0.080)
     }
-    
+
     min_expected, max_expected = expected_ranges[tier]
-    
+
     analysis = {
         "tier": tier,
         "sample_size": len(tier_trackers),
@@ -384,19 +382,19 @@ async def get_tier_efficiency_analysis(tier: str):
         },
         "recommendations": []
     }
-    
+
     # Generate recommendations
     over_budget_pct = (analysis["cost_analysis"]["over_budget"] / len(tier_trackers)) * 100
     avg_cost = analysis["cost_analysis"]["avg_cost"]
-    
+
     if over_budget_pct > 20:
         analysis["recommendations"].append(f"High over-budget rate ({over_budget_pct:.1f}%). Consider optimizing research depth for {tier} tier.")
-    
+
     if avg_cost < min_expected:
         analysis["recommendations"].append(f"Average cost (${avg_cost:.6f}) below expected range. Consider increasing research depth for better quality.")
     elif avg_cost > max_expected:
         analysis["recommendations"].append(f"Average cost (${avg_cost:.6f}) above expected range. Consider optimizing search parameters or model selection.")
     else:
         analysis["recommendations"].append(f"Cost performance is within expected range for {tier} tier.")
-    
+
     return analysis

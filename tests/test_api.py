@@ -55,6 +55,49 @@ def test_v2_scrape_actions_evaluate(client):
         assert "data" in data
 
 
+def test_scrape_get_captures_full_url_path(client):
+    with patch("app.service.scrape_url_get", new_callable=AsyncMock) as mock_scrape_get:
+        mock_scrape_get.return_value = {"success": True, "data": {"url": "https://example.com/a/b"}}
+
+        response = client.get("/v1/scrape/https://example.com/a/b")
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert mock_scrape_get.await_count == 1
+        assert mock_scrape_get.await_args.args[1] == "https://example.com/a/b"
+
+
+def test_cors_preflight_returns_headers(client):
+    response = client.options(
+        "/v2/scrape",
+        headers={
+            "Origin": "https://example.com",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 204
+    assert response.headers["access-control-allow-origin"] == "https://example.com"
+    assert "POST" in response.headers["access-control-allow-methods"]
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/v2/scrape",
+        "/v2/crawl",
+        "/v2/map",
+        "/v2/batch/scrape",
+        "/v2/search",
+        "/v2/extract",
+        "/v1/hermes/research",
+    ],
+)
+def test_invalid_json_returns_400(endpoint, client):
+    response = client.post(endpoint, content="{not-json", headers={"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert "Invalid JSON body" in response.json()["detail"]
+
+
 def test_scrape_missing_url(client):
     response = client.post("/v1/scrape", json={})
     assert response.status_code == 422
@@ -64,6 +107,18 @@ def test_scrape_invalid_url(client):
     response = client.post("/v1/scrape", json={"url": "not-a-url"})
     assert response.status_code == 400
     assert "Invalid URL" in response.json()["detail"]
+
+
+def test_cost_summary_invalid_days_returns_422(client):
+    response = client.get("/v1/hermes/costs/summary?days=abc")
+    assert response.status_code == 422
+    assert "days" in response.json()["detail"]
+
+
+def test_cost_cleanup_invalid_max_age_hours_returns_422(client):
+    response = client.post("/v1/hermes/costs/cleanup?max_age_hours=abc")
+    assert response.status_code == 422
+    assert "max_age_hours" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ from urllib.parse import unquote
 
 from loguru import logger
 from pydantic import BaseModel, ValidationError
-from robyn import Headers, Request, Response, Robyn, jsonify
+from robyn import ALLOW_CORS, Headers, Request, Response, Robyn, jsonify
 from robyn.openapi import OpenAPI
 
 from app import cost_endpoints as cost_api
@@ -31,6 +31,7 @@ from app.models import (
 OPENAPI = OpenAPI()
 OPENAPI.openapi_file_override = True
 app = Robyn(__file__, openapi=OPENAPI)
+ALLOW_CORS(app, origins="*", headers="*")
 
 
 @dataclass(slots=True)
@@ -107,7 +108,11 @@ def _service_request(request: Request) -> ServiceRequest:
 def _query_param(request: Request, key: str, default: Any = None) -> Any:
     qp = request.query_params
     if hasattr(qp, "get"):
-        val = qp.get(key)
+        try:
+            val = qp.get(key, None)
+        except TypeError:
+            # Compatibility for query param implementations that don't support a default arg.
+            val = qp.get(key)
         return default if val is None else val
     return default
 
@@ -187,6 +192,17 @@ async def _invoke_with_model(
     return await _invoke(runner())
 
 
+async def _invoke_with_json(
+    request: Request,
+    cb: Callable[[dict[str, Any]], Awaitable[Any]],
+) -> Any:
+    async def runner() -> Any:
+        payload = _request_json(request)
+        return await cb(payload)
+
+    return await _invoke(runner())
+
+
 # --- API routes ---
 
 
@@ -208,8 +224,10 @@ async def scrape_url(request: Request) -> Any:
 @app.post("/v2/scrape")
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def v2_scrape(request: Request) -> Any:
-    payload = _request_json(request)
-    return await _invoke(service.v2_scrape(_service_request(request), payload, ""))
+    return await _invoke_with_json(
+        request,
+        lambda payload: service.v2_scrape(_service_request(request), payload, ""),
+    )
 
 
 @app.post("/v1/scrape/bulk")
@@ -222,7 +240,7 @@ async def bulk_scrape(request: Request) -> Any:
     )
 
 
-@app.get("/v1/scrape/:url")
+@app.get("/v1/scrape/*url")
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def scrape_url_get(request: Request) -> Any:
     url = unquote(request.path_params.get("url", ""))
@@ -262,9 +280,11 @@ async def export_crawl(request: Request) -> Any:
 @app.post("/v2/crawl")
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def v2_crawl(request: Request) -> Any:
-    payload = _request_json(request)
     tasks = BackgroundTaskShim()
-    return await _invoke(service.v2_crawl(_service_request(request), payload, tasks, ""))
+    return await _invoke_with_json(
+        request,
+        lambda payload: service.v2_crawl(_service_request(request), payload, tasks, ""),
+    )
 
 
 @app.get("/v2/crawl/:job_id")
@@ -315,16 +335,20 @@ async def map_url(request: Request) -> Any:
 @app.post("/v2/map")
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def v2_map(request: Request) -> Any:
-    payload = _request_json(request)
-    return await _invoke(service.v2_map(_service_request(request), payload, ""))
+    return await _invoke_with_json(
+        request,
+        lambda payload: service.v2_map(_service_request(request), payload, ""),
+    )
 
 
 @app.post("/v2/batch/scrape")
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def v2_batch_scrape(request: Request) -> Any:
-    payload = _request_json(request)
     tasks = BackgroundTaskShim()
-    return await _invoke(service.v2_batch_scrape(_service_request(request), payload, tasks, ""))
+    return await _invoke_with_json(
+        request,
+        lambda payload: service.v2_batch_scrape(_service_request(request), payload, tasks, ""),
+    )
 
 
 @app.get("/v2/batch/scrape/:job_id")
@@ -348,15 +372,19 @@ async def v2_batch_errors(request: Request) -> Any:
 @app.post("/v2/search")
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def v2_search(request: Request) -> Any:
-    payload = _request_json(request)
-    return await _invoke(service.v2_search(_service_request(request), payload, ""))
+    return await _invoke_with_json(
+        request,
+        lambda payload: service.v2_search(_service_request(request), payload, ""),
+    )
 
 
 @app.post("/v2/extract")
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def v2_extract(request: Request) -> Any:
-    payload = _request_json(request)
-    return await _invoke(service.v2_extract(_service_request(request), payload, ""))
+    return await _invoke_with_json(
+        request,
+        lambda payload: service.v2_extract(_service_request(request), payload, ""),
+    )
 
 
 @app.post("/v1/hermes/leads/search")
@@ -381,8 +409,7 @@ async def hermes_enrich(request: Request) -> Any:
 
 @app.post("/v1/hermes/research")
 async def hermes_research(request: Request) -> Any:
-    payload = _request_json(request)
-    return await _invoke(service.hermes_research(payload))
+    return await _invoke_with_json(request, service.hermes_research)
 
 
 # --- Cost endpoints ---
@@ -398,9 +425,12 @@ async def cost_job(request: Request) -> Any:
 
 @app.get("/v1/hermes/costs/summary")
 async def cost_summary(request: Request) -> Any:
-    tier = _query_param(request, "tier", None)
-    days = _query_param_int(request, "days", 7, minimum=1)
-    return await _invoke(cost_api.get_cost_summary(days=days, tier=tier))
+    async def runner() -> Any:
+        tier = _query_param(request, "tier", None)
+        days = _query_param_int(request, "days", 7, minimum=1)
+        return await cost_api.get_cost_summary(days=days, tier=tier)
+
+    return await _invoke(runner())
 
 
 @app.get("/v1/hermes/costs/providers")
@@ -430,8 +460,11 @@ async def cost_alerts() -> Any:
 
 @app.post("/v1/hermes/costs/cleanup")
 async def cost_cleanup(request: Request) -> Any:
-    max_age_hours = _query_param_int(request, "max_age_hours", 24, minimum=1)
-    return await _invoke(cost_api.cleanup_old_trackers(max_age_hours=max_age_hours))
+    async def runner() -> Any:
+        max_age_hours = _query_param_int(request, "max_age_hours", 24, minimum=1)
+        return await cost_api.cleanup_old_trackers(max_age_hours=max_age_hours)
+
+    return await _invoke(runner())
 
 
 @app.get("/v1/hermes/costs/efficiency/tier/:tier")

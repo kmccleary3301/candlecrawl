@@ -112,6 +112,17 @@ def _query_param(request: Request, key: str, default: Any = None) -> Any:
     return default
 
 
+def _query_param_int(request: Request, key: str, default: int, *, minimum: int | None = None) -> int:
+    raw = _query_param(request, key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Query parameter '{key}' must be an integer") from exc
+    if minimum is not None and value < minimum:
+        raise HTTPException(status_code=422, detail=f"Query parameter '{key}' must be >= {minimum}")
+    return value
+
+
 def _request_json(request: Request) -> dict[str, Any]:
     try:
         value = request.json()
@@ -387,9 +398,8 @@ async def cost_job(request: Request) -> Any:
 
 @app.get("/v1/hermes/costs/summary")
 async def cost_summary(request: Request) -> Any:
-    days_raw = _query_param(request, "days", 7)
     tier = _query_param(request, "tier", None)
-    days = int(days_raw)
+    days = _query_param_int(request, "days", 7, minimum=1)
     return await _invoke(cost_api.get_cost_summary(days=days, tier=tier))
 
 
@@ -420,8 +430,7 @@ async def cost_alerts() -> Any:
 
 @app.post("/v1/hermes/costs/cleanup")
 async def cost_cleanup(request: Request) -> Any:
-    max_age_hours_raw = _query_param(request, "max_age_hours", 24)
-    max_age_hours = int(max_age_hours_raw)
+    max_age_hours = _query_param_int(request, "max_age_hours", 24, minimum=1)
     return await _invoke(cost_api.cleanup_old_trackers(max_age_hours=max_age_hours))
 
 

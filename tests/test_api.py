@@ -1,9 +1,12 @@
 import asyncio
 import time
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.framework_shims import HTTPException
+from app.main import _request_json
 from app.models import FirecrawlDocument
 
 
@@ -96,6 +99,30 @@ def test_invalid_json_returns_400(endpoint, client):
     response = client.post(endpoint, content="{not-json", headers={"Content-Type": "application/json"})
     assert response.status_code == 400
     assert "Invalid JSON body" in response.json()["detail"]
+
+
+def test_request_json_reads_body_bytes_before_request_json():
+    class RequestStub:
+        body = b'{"url":"https://example.com"}'
+
+        def json(self):
+            raise RuntimeError("request.json() should not be called")
+
+    assert _request_json(RequestStub()) == {"url": "https://example.com"}
+
+
+def test_request_json_rejects_non_object_body():
+    class RequestStub:
+        body = b'["https://example.com"]'
+
+        def json(self):
+            raise RuntimeError("request.json() should not be called")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _request_json(RequestStub())
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "JSON body must be an object"
 
 
 def test_scrape_missing_url(client):
@@ -208,3 +235,17 @@ def test_batch_scrape(client):
         assert isinstance(results, list)
         assert len(results) == 2
         assert all(r["success"] for r in results)
+
+
+def test_batch_status_serializes_datetime_fields(client):
+    with patch("app.service.get_batch_status", new_callable=AsyncMock) as mock_get_batch_status:
+        mock_get_batch_status.return_value = {
+            "id": "job-123",
+            "status": "completed",
+            "expires_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        }
+
+        response = client.get("/v1/batch-scrape/job-123")
+
+        assert response.status_code == 200
+        assert response.json()["expires_at"] == "2026-01-02T03:04:05+00:00"

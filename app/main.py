@@ -1,8 +1,11 @@
 
 import asyncio
+import json
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import date, datetime
+from datetime import time as dt_time
 from functools import wraps
 from typing import Any, Awaitable, Callable
 from urllib.parse import unquote
@@ -129,8 +132,16 @@ def _query_param_int(request: Request, key: str, default: int, *, minimum: int |
 
 
 def _request_json(request: Request) -> dict[str, Any]:
+    body = getattr(request, "body", None)
     try:
-        value = request.json()
+        if isinstance(body, dict):
+            value = body
+        elif isinstance(body, (bytes, bytearray, memoryview)):
+            value = json.loads(bytes(body).decode("utf-8"))
+        elif isinstance(body, str):
+            value = json.loads(body)
+        else:
+            value = request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}") from exc
     if not isinstance(value, dict):
@@ -149,6 +160,8 @@ def _parse_model(request: Request, model_cls: type[BaseModel]) -> BaseModel:
 def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
+    if isinstance(value, (datetime, date, dt_time)):
+        return value.isoformat()
     if isinstance(value, list):
         return [_jsonable(v) for v in value]
     if isinstance(value, tuple):

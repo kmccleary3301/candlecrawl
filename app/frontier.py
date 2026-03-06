@@ -4,6 +4,7 @@ This module provides abstractions to schedule and deduplicate crawl URLs.
 It is intentionally small and forward-compatible with Redis-backed impls.
 """
 from __future__ import annotations
+
 import asyncio
 from typing import Optional, Tuple
 

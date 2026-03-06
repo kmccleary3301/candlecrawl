@@ -1,31 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import json
+
+# Import the original BCAS tool-calling abstraction (ensure repo root on sys.path)
+import os as _os
 import re
+import sys as _sys
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel
 
-from app.providers.openrouter import OpenRouterClient, OpenRouterChatRequest, ORMessage
-from app.providers.serper import SerperClient, SerperSearchRequest
-from app.providers.scrapedo import ScrapeDoClient, ScrapeDoRequest
-from app.scraper import scraper
-from app.models import ScrapeOptions, ContactExtractionConfig
-from app.cost_tracking import JobCostTracker, create_cost_tracker, complete_cost_tracker
+from app.cost_tracking import JobCostTracker, complete_cost_tracker, create_cost_tracker
 from app.model_pricing import estimate_cost_usd
+from app.models import ContactExtractionConfig, ScrapeOptions
+from app.providers.openrouter import OpenRouterChatRequest, OpenRouterClient, ORMessage
+from app.providers.scrapedo import ScrapeDoClient, ScrapeDoRequest
+from app.providers.serper import SerperClient, SerperSearchRequest
+from app.scraper import scraper
 
-# Import the original BCAS tool-calling abstraction (ensure repo root on sys.path)
-import os as _os, sys as _sys
 _ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
 if _ROOT not in _sys.path:
     _sys.path.append(_ROOT)
 from bcas_original_tool_calling.base import (
-    FunctionCallDefinition as BCAS_FunctionCallDefinition,
     FunctionCallArgumentDefinition,
+)
+from bcas_original_tool_calling.base import (
+    FunctionCallDefinition as BCAS_FunctionCallDefinition,
 )
 from bcas_original_tool_calling.pythonic_02 import Pythonic02
 from contact_extraction_specification import build_contact_extraction_prompt, build_contact_output_format_instructions
@@ -69,7 +71,7 @@ You must attempt to answer it by performing consecutive searches and retrieving 
 You must perform these searches and make notes of the information as you parse through it until you feel confident that you can answer the question.
 
 Create a plan on how you are going to use your searches to gather information to answer the question.
-Keep in mind potential limitations in the sources and search corpus. 
+Keep in mind potential limitations in the sources and search corpus.
 After this, you will be given tools to search, and you should follow the plan you created.
 
 {search_limitation}{context_limitation}
@@ -123,19 +125,19 @@ def build_final_answer_prompt(sources_count: int, tier: Optional[str] = None, en
             lines.append("Target length: ~1200–2000 words (flexible).")
         elif tr == "PRECISION":
             lines.append("Target length: ~3000–5000 words (flexible).")
-    
+
     # Add contact extraction instructions if configured
     if contact_extraction:
         contact_format_instructions = build_contact_output_format_instructions(contact_extraction)
         lines.append(contact_format_instructions)
-    
+
     return "\n".join(lines)
 
 ENCOURAGE_INTERMITENT_REASONING_PROMPT = (
     """
 Analyze these search results.
 Create a plan on how you are going to proceed with your search.
-Keep in mind potential limitations in the sources and search corpus. 
+Keep in mind potential limitations in the sources and search corpus.
 
 After you are done, you MUST call one of the provided tools. Complete your response by calling one of the provided tools.
 
@@ -201,40 +203,40 @@ class HermesSearchOrchestrator:
                     except Exception:
                         pass
                 return RetrievedSource(text="", url=url, title=None, meta={"fallback": True, "error": str(e)[:200]})
-        
+
         # Track Firecrawl processing cost
         if self.cost_tracker:
             self.cost_tracker.add_firecrawl_scrape()
-        
+
         # Process document with chunking if needed
         from .chunking import process_document_for_search
         markdown_content = doc.markdown or ""
-        
+
         if not markdown_content.strip():
             return RetrievedSource(text="", url=url, title=doc.metadata.title if doc.metadata else None, meta={"fallback": False, "error": "No content"})
-        
+
         # Use chunking logic - if document is small enough, return full doc; otherwise return best chunk
         processed_docs = process_document_for_search(
             text=markdown_content,
             url=url,
             title=doc.metadata.title if doc.metadata else None,
             max_tokens=500,  # Max tokens for full document
-            chunk_size=1200,  # Chunk size in characters  
+            chunk_size=1200,  # Chunk size in characters
             overlap=200  # Overlap between chunks
         )
-        
+
         if not processed_docs:
             return RetrievedSource(text="", url=url, title=doc.metadata.title if doc.metadata else None, meta={"fallback": False, "error": "No processable content"})
-        
+
         # For direct scraping, return the first chunk/document with metadata
         best_doc = processed_docs[0]
-        
+
         return RetrievedSource(
-            text=best_doc['text'], 
-            url=url, 
-            title=doc.metadata.title if doc.metadata else None, 
+            text=best_doc['text'],
+            url=url,
+            title=doc.metadata.title if doc.metadata else None,
             meta={
-                "fallback": False, 
+                "fallback": False,
                 "chunking_metadata": best_doc['metadata'],
                 "total_processed_chunks": len(processed_docs)
             }
@@ -243,9 +245,9 @@ class HermesSearchOrchestrator:
     async def search_and_retrieve(self, query: str, limit: int = 10) -> List[RetrievedSource]:
         # Use Hermes RAG server for SERP -> scrape -> ingest -> retrieve pipeline
         import httpx
-        
+
         hermes_rag_base = "http://127.0.0.1:8010"
-        
+
         try:
             if self.force_direct:
                 raise Exception("force_direct_scrape")
@@ -259,18 +261,18 @@ class HermesSearchOrchestrator:
                     "similarity_weight": 0.3,  # Increase similarity weight vs BM25
                     "bm25_weight": 0.7
                 }
-                
+
                 _t0 = _time.time()
                 # Prefer BM25-only for BROADCAST/TARGETED tiers to reduce fragility/latency
                 path = "/v1/hermes/serp_ingest_bm25" if (self.tier in ("BROADCAST", "TARGETED")) else "/v1/hermes/serp_ingest_search"
                 resp = await client.post(f"{hermes_rag_base}{path}", json=payload)
                 resp.raise_for_status()
                 _lat_ms = int((_time.time() - _t0) * 1000)
-                
+
                 data = resp.json()
                 if not data.get("success"):
                     raise Exception(f"Hermes RAG search failed: {data}")
-                
+
                 search_id = data.get("search_id")
                 sources = []
                 if self.tier in ("BROADCAST", "TARGETED"):
@@ -293,7 +295,7 @@ class HermesSearchOrchestrator:
                         title = doc.get("metadata", {}).get("title", "")
                         score = doc.get("score", 0.0)
                         sources.append(RetrievedSource(text=content[:20000], url=url, title=title, meta={"search_id": search_id, "score": score, "from_rag": True}))
-                
+
                 if self.cost_tracker:
                     try:
                         self.cost_tracker.add_trace_event(
@@ -308,7 +310,7 @@ class HermesSearchOrchestrator:
                     except Exception:
                         pass
                 return sources
-                
+
         except Exception as e:
             # Fallback to original implementation if RAG server fails
             import traceback
@@ -327,7 +329,7 @@ class HermesSearchOrchestrator:
                     )
                 except Exception:
                     pass
-            
+
             search_id = str(uuid.uuid4())
             import time as _time
             _t_s = _time.time()
@@ -420,7 +422,7 @@ class HermesBStar04:
         self.tool_caller = Pythonic02()
         self.trace_level = str(kwargs.get("debug_trace_level", "summary")).lower()
         self.trace_excerpt_len = 800 if self.trace_level == "verbose" else 200
-        
+
         # Initialize cost tracking
         self.job_id = job_id or str(uuid.uuid4())
         self.tier = tier
@@ -445,7 +447,7 @@ class HermesBStar04:
         _t0 = _time.time()
         response, actual_cost = await self.openrouter.chat_completions(req)
         _lat_ms = int((_time.time() - _t0) * 1000)
-        
+
         # Track OpenRouter cost
         if self.cost_tracker:
             est_cost = None
@@ -476,13 +478,13 @@ class HermesBStar04:
                 )
             except Exception:
                 pass
-        
+
         return response
 
     async def run_async(self, question: str, max_searches: int | Literal["unlimited"]) -> Dict[str, Any]:
         start_time = time.time()
         current_token_usage = 0
-        
+
         # Enhance question with contact extraction requirements if configured
         enhanced_question = question
         if self.contact_extraction:
@@ -637,7 +639,7 @@ class HermesBStar04:
                 if self.cost_tracker:
                     self.cost_tracker.complete_job()
                     complete_cost_tracker(self.job_id)
-                
+
                 return {
                     "chat_history": chat_history,
                     "output": final_answer,

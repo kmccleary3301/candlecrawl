@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 from pydantic import BaseModel, Field
@@ -83,12 +83,12 @@ class OpenRouterClient:
                 raise ProviderError("OpenRouter error", status_code=resp.status_code, payload=resp.text)
             data = resp.json()
             response = OpenRouterChatResponse.model_validate(data)
-            
+
             # Extract actual cost from usage data
             actual_cost = None
             if response.usage and hasattr(response.usage, 'cost'):
                 actual_cost = response.usage.cost
-            
+
             return response, actual_cost
         finally:
             if created_client:

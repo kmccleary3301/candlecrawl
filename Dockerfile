@@ -1,9 +1,17 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir uv
+
+COPY pyproject.toml README.md ./
+RUN uv sync --no-dev
+
 COPY app ./app
+COPY contracts ./contracts
+
+ENV PORT=3010
 
 EXPOSE 3010
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3010"]
+
+CMD ["uv", "run", "python", "-m", "app.main"]

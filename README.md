@@ -1,73 +1,51 @@
-# Firecrawl FastAPI (Compacted)
+# CandleCrawl (Robyn)
 
-A production-ready, modular web scraping and crawling service built with FastAPI.
+A production-ready, modular web scraping and crawling service built with Robyn.
 
 ## Features
 - HTTP + Playwright rendering with heuristics and fallbacks
-- Markdown/HTML/links extraction; PDF/image metadata fast-paths
-- Concurrent, depth-aware crawler with:
-  - include/exclude path filters, domain/subdomain policy
-  - robots.txt and crawl-delay politeness
-  - global budgets (max_pages, max_time, max_bytes)
-  - blocked detection (captcha, ip_block, rate_limited)
-  - cancel/export endpoints
-- Resilient HTTP client with retries/backoff and Retry-After support
-- Frontier abstraction (in-memory) for forward-compatible Redis frontier
-- Lifespan startup/shutdown
+- Markdown/HTML/links extraction plus PDF/image metadata fast paths
+- Concurrent, depth-aware crawler with include/exclude path filters, robots.txt politeness, and budgets
+- v1 + v2 Firecrawl-compatible endpoints
+- Hermes provider endpoints (Serper, Scrape.do, OpenRouter)
+- Redis-backed or in-memory job/cache/idempotency storage
 
-## API
-- POST /v1/scrape
-- POST /v1/scrape/bulk
-- GET  /v1/scrape/{url}
-- POST /v1/crawl
-- GET  /v1/crawl/{id}
-- POST /v1/crawl/{id}/cancel
-- GET  /v1/crawl/{id}/export?format=jsonl
-- POST /v1/map
+## API (high level)
+- `/health`
+- `/v1/*` scrape/crawl/map/batch/hermes endpoints
+- `/v2/*` scrape/crawl/map/batch/search/extract endpoints
 
-See `app/models.py` for request/response models.
+See `app/models.py` and `contracts/openapi-v1.yaml` for schemas.
 
-## Config (env)
-- HOST, PORT, REDIS_URL
-- RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW
-- default_timeout, max_concurrent_requests, user_agent
-- retry_max_attempts, backoff_base_ms, backoff_max_ms
+## Configuration
+Environment variables are loaded from `.env` and process env via `pydantic-settings`.
+Key settings:
+- `HOST`, `PORT`, `REDIS_URL`
+- `RATE_LIMIT_REQUESTS`, `RATE_LIMIT_WINDOW`
+- `DEFAULT_TIMEOUT`, `MAX_CONCURRENT_REQUESTS`, `USER_AGENT`
+- provider keys: `SERPER_DEV_API_KEY`, `SCRAPE_DO_API_KEY`, `OPENROUTER_API_KEY`
 
-## Run
+## Development workflow (uv)
+```bash
+uv sync
+uv run python -m app.main
 ```
-pip install -r requirements.txt
-python -m uvicorn app.main:app --host 0.0.0.0 --port 3010
-```
+Default port is `3002`; set `PORT` to override.
 
-## Hermes Providers (Serper.dev, Scrape.do, OpenRouter)
-
-Environment variables (loaded via `.env` or process env):
-- `SERPER_DEV_API_KEY` — Serper.dev API key
-- `SCRAPE_DO_API_KEY` — Scrape.do API key
-- `OPENROUTER_API_KEY` — OpenRouter API key
-
-Smoke tests (optional, use your keys):
-```
-python -m app.scripts.provider_smoketests
+Canonical checks:
+```bash
+uv run ruff check .
+uv run pytest -q
+uv run python -m app.contract_check
 ```
 
-Provider classes live in `app/providers/` with Pydantic request/response models.
-
-## Hermes API (prototype)
-
-Endpoints:
-- POST `/v1/hermes/leads/search` → Serper.dev search
-- POST `/v1/hermes/leads/enrich` → scrape domains via internal scraper
-- POST `/v1/hermes/external-scrape` → Scrape.do fallback
-- POST `/v1/hermes/compose` → OpenRouter chat completion
-
-Example:
-```
-curl -X POST http://localhost:3010/v1/hermes/leads/search -H 'Content-Type: application/json' -d '{"query":"best devops startups","limit":5}'
+## Docker
+```bash
+docker build -t candlecrawl .
+docker run --rm -p 3010:3010 candlecrawl
 ```
 
-## Tests
+## Optional provider smoke tests
+```bash
+uv run python -m app.scripts.provider_smoketests
 ```
-pytest -q
-```
-

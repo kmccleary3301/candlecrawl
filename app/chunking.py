@@ -2,10 +2,11 @@
 Document chunking utilities for optimal RAG performance
 """
 
-import re
-import tiktoken
-from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import tiktoken
+
 
 @dataclass
 class ChunkMetadata:
@@ -34,25 +35,25 @@ def should_chunk_document(text: str, max_tokens: int = 500) -> bool:
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
     """
     Chunk text into overlapping segments
-    
+
     Args:
         text: Text to chunk
         chunk_size: Target chunk size in characters
         overlap: Overlap between chunks in characters
-    
+
     Returns:
         List of text chunks
     """
     if len(text) <= chunk_size:
         return [text]
-    
+
     chunks = []
     start = 0
-    
+
     while start < len(text):
         # Calculate end position
         end = start + chunk_size
-        
+
         # If we're not at the end, try to break at a good boundary
         if end < len(text):
             # Look for sentence boundaries first
@@ -70,17 +71,17 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[st
                     if newline_end > start + chunk_size // 2:
                         end = newline_end + 1
                     # Otherwise use the original end position
-        
+
         # Extract chunk
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        
+
         # Calculate next start position with overlap
         if end >= len(text):
             break
         start = max(start + 1, end - overlap)
-    
+
     return chunks
 
 def create_chunk_metadata(text: str, chunk_index: int = 0, total_chunks: int = 1) -> ChunkMetadata:
@@ -93,12 +94,12 @@ def create_chunk_metadata(text: str, chunk_index: int = 0, total_chunks: int = 1
         is_full_document=(total_chunks == 1)
     )
 
-def process_document_for_search(text: str, url: str, title: Optional[str] = None, 
-                               max_tokens: int = 500, chunk_size: int = 1200, 
+def process_document_for_search(text: str, url: str, title: Optional[str] = None,
+                               max_tokens: int = 500, chunk_size: int = 1200,
                                overlap: int = 200) -> List[Dict[str, Any]]:
     """
     Process a document into search-ready chunks or return full document if small enough
-    
+
     Args:
         text: Document text
         url: Document URL
@@ -106,18 +107,18 @@ def process_document_for_search(text: str, url: str, title: Optional[str] = None
         max_tokens: Maximum tokens for full document inclusion
         chunk_size: Target chunk size in characters
         overlap: Overlap between chunks in characters
-    
+
     Returns:
         List of document/chunk objects with metadata
     """
     if not text.strip():
         return []
-    
+
     # Check if document should be chunked
     if should_chunk_document(text, max_tokens):
         # Chunk the document
         chunks = chunk_text(text, chunk_size, overlap)
-        
+
         results = []
         for i, chunk in enumerate(chunks):
             metadata = create_chunk_metadata(chunk, i, len(chunks))
@@ -157,23 +158,23 @@ def process_document_for_search(text: str, url: str, title: Optional[str] = None
 def reconstruct_full_document(chunks: List[Dict[str, Any]]) -> Optional[str]:
     """
     Reconstruct full document from chunks if they're from the same document
-    
+
     Args:
         chunks: List of chunk objects with metadata
-    
+
     Returns:
         Full document text or None if chunks are from different documents
     """
     if not chunks:
         return None
-    
+
     # Check if all chunks are from the same document
     first_url = chunks[0].get('url')
     if not all(chunk.get('url') == first_url for chunk in chunks):
         return None
-    
+
     # Sort chunks by index
     sorted_chunks = sorted(chunks, key=lambda x: x.get('metadata', {}).get('chunk_index', 0))
-    
+
     # Simple reconstruction - join with double newlines to indicate chunk boundaries
     return '\n\n'.join(chunk['text'] for chunk in sorted_chunks)

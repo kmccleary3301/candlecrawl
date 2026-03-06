@@ -3,24 +3,26 @@ import base64
 import io
 import re
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
 from loguru import logger
 from markdownify import markdownify as md
 from PIL import Image
+from playwright.async_api import Browser, Page, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pypdf import PdfReader
-from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
 
 from app.config import settings
 from app.http_client import ResilientHttpClient
-from app.models import FirecrawlDocument, DocumentMetadata, ScrapeOptions, ScrapeAction
+from app.models import DocumentMetadata, FirecrawlDocument, ScrapeAction, ScrapeOptions
+
 
 class ScrapingService:
     def __init__(self):
         self.browser: Optional[Browser] = None
-        
+
     async def initialize_browser(self):
         if self.browser is None:
             playwright = await async_playwright().start()
@@ -28,7 +30,7 @@ class ScrapingService:
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
-    
+
     async def close_browser(self):
         if self.browser:
             try:
@@ -38,7 +40,7 @@ class ScrapingService:
                 # is already gone (e.g., Ctrl-C / abrupt termination).
                 pass
             self.browser = None
-    
+
     async def scrape_url(self, url: str, options: ScrapeOptions = None) -> FirecrawlDocument:
         if options is None:
             options = ScrapeOptions()
@@ -81,21 +83,21 @@ class ScrapingService:
             options.mobile or
             (options.actions is not None and len(options.actions) > 0)
         )
-    
+
     async def _scrape_with_http(self, url: str, options: ScrapeOptions, timeout_override: Optional[int] = None) -> FirecrawlDocument:
         headers = {
             "User-Agent": settings.user_agent,
             **(options.headers or {})
         }
-        
+
         timeout = timeout_override or options.timeout or settings.default_timeout
-        
+
         client = ResilientHttpClient(timeout=timeout, follow_redirects=True)
         response = await client.get(url, headers=headers)
         response.raise_for_status()
 
         content_type = response.headers.get("content-type", "").lower()
-        
+
         if "text/html" in content_type:
             # Also return raw_html to be used in the fallback check
             doc = await self._process_html_content(url, response.text, response.status_code, options)
@@ -124,7 +126,7 @@ class ScrapingService:
         try:
             if options.headers:
                 await page.set_extra_http_headers(options.headers)
-            
+
             timeout = (options.timeout or settings.default_timeout) * 1000
             await page.goto(url, timeout=timeout * 2, wait_until="domcontentloaded")
 
@@ -169,23 +171,23 @@ class ScrapingService:
 
             final_url = page.url or url
             html_content = await page.content()
-            
+
             screenshot_data = None
             if "screenshot" in (options.formats or []):
                 screenshot_bytes = await page.screenshot(full_page=True)
                 screenshot_data = base64.b64encode(screenshot_bytes).decode()
-            
+
             document = await self._process_html_content(final_url, html_content, 200, options)
             document.url = final_url
-            
+
             if screenshot_data:
                 document.screenshot = screenshot_data
-            
+
             return document
-            
+
         finally:
             await context.close()
-    
+
     async def _scrape_html_page(self, url: str, options: ScrapeOptions) -> FirecrawlDocument:
         # This function contains the previous logic of trying httpx GET then falling back to browser
         if self._needs_browser_rendering(options):
@@ -299,9 +301,9 @@ class ScrapingService:
     async def _get_file_metadata(self, url: str, headers: httpx.Headers, options: ScrapeOptions) -> FirecrawlDocument:
         content_type = headers.get('content-type', '').lower()
         content_length = headers.get('content-length')
-        
+
         file_meta = {"content_type": content_type, "content_length": content_length}
-        
+
         if content_type == 'application/pdf':
             page_count = await self._get_pdf_page_count_fast(url, options.headers)
             file_meta['page_count'] = page_count
@@ -339,7 +341,7 @@ class ScrapingService:
                     logger.warning(f"Ranged request for PDF page count for {url} failed with status {response.status_code}. Returning -1.")
         except Exception as e:
             logger.warning(f"Ranged request for PDF page count failed for {url}: {e}. Returning -1.")
-        
+
         return -1
 
     async def _get_image_dimensions_fast(self, url: str, req_headers: Optional[dict]) -> Optional[tuple[int, int]]:
@@ -359,19 +361,19 @@ class ScrapingService:
         title = None
         description = None
         language = None
-        
+
         title_tag = soup.find("title")
         if title_tag:
             title = title_tag.get_text().strip()
-        
+
         desc_tag = soup.find("meta", attrs={"name": "description"})
         if desc_tag:
             description = desc_tag.get("content", "").strip()
-        
+
         html_tag = soup.find("html")
         if html_tag:
             language = html_tag.get("lang")
-        
+
         return DocumentMetadata(
             title=title,
             description=description,
@@ -380,20 +382,20 @@ class ScrapingService:
             status_code=status_code,
             content_type="text/html"
         )
-    
+
     def _extract_main_content(self, soup: BeautifulSoup) -> BeautifulSoup:
         # A more intelligent, additive approach to finding the main content
-        
+
         # Heuristics for finding the main content container, with Wikipedia's specific one first
         main_content_selectors = ["#mw-content-text", "main", "article", "[role='main']", "#main", "#content"]
-        
+
         main_container = None
         for selector in main_content_selectors:
             main_container = soup.select_one(selector)
             if main_container:
                 logger.info(f"Found main content container with selector: {selector}")
                 break
-                
+
         if main_container:
             # If we found a main container, use it as the new soup
             # We create a new soup object to avoid modifying the original during iteration
@@ -407,24 +409,24 @@ class ScrapingService:
             logger.warning("No main content container found, falling back to subtractive method.")
             for script in soup(["script", "style", "nav", "header", "footer", "aside"]):
                 script.decompose()
-            
+
             selectors_to_remove = [
                 '[class*="nav"]', '[class*="sidebar"]', '[class*="menu"]',
                 '[class*="footer"]', '[class*="header"]', '.skip-link', '[href="#content"]'
             ]
-            
+
             for selector in selectors_to_remove:
                 for element in soup.select(selector):
                     element.decompose()
-            
+
             return soup
 
     async def _process_html_content(self, url: str, html: str, status_code: Optional[int], options: ScrapeOptions) -> FirecrawlDocument:
         soup = BeautifulSoup(html, "html.parser")
-        
+
         # Store the original, unprocessed soup for raw_html
         raw_html_soup = html if "rawHtml" in (options.formats or []) else None
-        
+
         # Content filtering happens FIRST
         if options.include_tags:
             logger.info(f"Using include_tags (whitelist mode): {options.include_tags}")
@@ -437,7 +439,7 @@ class ScrapingService:
         else:
             if options.only_main_content:
                  soup = self._extract_main_content(soup)
-            
+
             if options.exclude_tags:
                 logger.info(f"Using exclude_tags (blacklist mode): {options.exclude_tags}")
                 for selector in options.exclude_tags:
@@ -451,7 +453,7 @@ class ScrapingService:
         # (We still preserve the original `rawHtml` via `raw_html_soup` when requested.)
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
-        
+
         # Absolutize links before final processing, unless instructed otherwise
         if not options.use_relative_links:
             soup = self._absolutize_links(soup, url)
@@ -466,21 +468,21 @@ class ScrapingService:
 
         document = FirecrawlDocument(url=url, metadata=metadata)
         formats = options.formats or ["markdown"]
-        
+
         if "html" in formats:
             document.html = str(soup)
-        
+
         if raw_html_soup:
             document.raw_html = raw_html_soup
-        
+
         if "markdown" in formats or "content" in formats:
             markdown_content = self._html_to_markdown(str(soup))
             document.markdown = markdown_content
-        
+
         if "links" in formats:
             # Links should probably be extracted from the processed soup to be relevant
             document.links = self._extract_links(soup, url)
-        
+
         return document
 
     def _absolutize_links(self, soup: BeautifulSoup, base_url: str) -> BeautifulSoup:
@@ -497,7 +499,7 @@ class ScrapingService:
             if src.startswith("data:image"):
                 img.decompose()
         return soup
-    
+
     def _html_to_markdown(self, html: str) -> str:
         markdown_content = md(
             html,
@@ -506,22 +508,22 @@ class ScrapingService:
             strong_em_style="**",
             strip=["script", "style"]
         )
-        
+
         # Post-processing - remove problematic content
         # Remove base64 encoded images that might have slipped through
-        markdown_content = re.sub(r'!\[.*?\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=]{100,}\)', 
-                                  '![Image content removed - base64 encoded]', 
+        markdown_content = re.sub(r'!\[.*?\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=]{100,}\)',
+                                  '![Image content removed - base64 encoded]',
                                   markdown_content)
-        
+
         # Remove skip to content links
         markdown_content = re.sub(r'\[Skip to Content\]\(#[^\)]*\)', "", markdown_content, flags=re.IGNORECASE)
-        
+
         # Clean up excessive whitespace
         markdown_content = re.sub(r'\n\s*\n\s*\n', '\n\n', markdown_content)
         markdown_content = markdown_content.strip()
-        
+
         return markdown_content
-    
+
     def _extract_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
         links = []
         for link in soup.find_all("a", href=True):
@@ -532,4 +534,4 @@ class ScrapingService:
         return links
 
 # Global scraping service instance
-scraper = ScrapingService() 
+scraper = ScrapingService()

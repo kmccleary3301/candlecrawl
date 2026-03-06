@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, Field, HttpUrl
 
 from app.config import settings
 from app.providers.base import ProviderError
@@ -21,7 +21,7 @@ class ScrapeDoResponse(BaseModel):
     content: str
     status_code: int
     content_type: Optional[str] = None
-    # Cost tracking fields  
+    # Cost tracking fields
     credits_used: int = Field(default=1)
     estimated_cost: float = Field(default=0.000116)  # Hobby plan rate
 

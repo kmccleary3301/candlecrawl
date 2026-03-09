@@ -44,6 +44,12 @@ from app.cost_endpoints import router as cost_router
 async def lifespan(app: FastAPI):
     print("Starting Firecrawl API...")
     print(f"Redis available: {redis_available}")
+    browser_ready, browser_error = await scraper.preflight_browser_runtime()
+    if browser_ready:
+        print("Browser runtime ready: True")
+    else:
+        logger.error(f"Browser runtime preflight failed: {browser_error}")
+        print(f"Browser runtime ready: False ({browser_error})")
     try:
         yield
     finally:
@@ -476,7 +482,12 @@ def _set_idempotent_response(scope: str, key: str, payload_hash: str, response: 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
-    return HealthResponse()
+    browser_status = scraper.get_browser_runtime_status()
+    return HealthResponse(
+        status="healthy" if browser_status["browser_ready"] else "degraded",
+        browserReady=bool(browser_status["browser_ready"]),
+        browserError=browser_status["browser_error"],
+    )
 
 @app.post("/v1/scrape", response_model=ScrapeResponse)
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")

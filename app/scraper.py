@@ -11,7 +11,13 @@ from loguru import logger
 from markdownify import markdownify as md
 from PIL import Image
 from pypdf import PdfReader
-from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from app.config import settings
 from app.http_client import ResilientHttpClient
@@ -20,14 +26,50 @@ from app.models import FirecrawlDocument, DocumentMetadata, ScrapeOptions, Scrap
 class ScrapingService:
     def __init__(self):
         self.browser: Optional[Browser] = None
+        self.playwright: Optional[Playwright] = None
+        self.browser_runtime_ready: Optional[bool] = None
+        self.browser_runtime_error: Optional[str] = None
+
+    def _normalize_browser_runtime_error(self, exc: Exception) -> str:
+        message = str(exc).strip() or exc.__class__.__name__
+        lowered = message.lower()
+        if "executable doesn't exist" in lowered or "playwright install" in lowered:
+            return "Playwright Chromium runtime missing; run `python -m playwright install chromium`"
+        return message
+
+    def get_browser_runtime_status(self) -> dict[str, Optional[str] | bool]:
+        return {
+            "browser_ready": bool(self.browser_runtime_ready),
+            "browser_error": self.browser_runtime_error,
+        }
+
+    async def preflight_browser_runtime(self) -> tuple[bool, Optional[str]]:
+        try:
+            await self.initialize_browser()
+        except Exception:
+            return False, self.browser_runtime_error
+        return True, None
         
     async def initialize_browser(self):
         if self.browser is None:
-            playwright = await async_playwright().start()
-            self.browser = await playwright.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
-            )
+            self.playwright = await async_playwright().start()
+            try:
+                self.browser = await self.playwright.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"]
+                )
+                self.browser_runtime_ready = True
+                self.browser_runtime_error = None
+            except Exception as exc:
+                self.browser_runtime_ready = False
+                self.browser_runtime_error = self._normalize_browser_runtime_error(exc)
+                if self.playwright is not None:
+                    try:
+                        await self.playwright.stop()
+                    except Exception:
+                        pass
+                    self.playwright = None
+                raise RuntimeError(self.browser_runtime_error) from exc
     
     async def close_browser(self):
         if self.browser:
@@ -38,6 +80,12 @@ class ScrapingService:
                 # is already gone (e.g., Ctrl-C / abrupt termination).
                 pass
             self.browser = None
+        if self.playwright:
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
+            self.playwright = None
     
     async def scrape_url(self, url: str, options: ScrapeOptions = None) -> FirecrawlDocument:
         if options is None:

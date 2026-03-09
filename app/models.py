@@ -176,6 +176,8 @@ class HealthResponse(BaseModel):
     status: str = "healthy"
     version: str = "1.0.0"
     timestamp: datetime = Field(default_factory=utc_now)
+    browser_ready: bool = Field(default=True, alias="browserReady")
+    browser_error: Optional[str] = Field(default=None, alias="browserError")
 
 # --- Hermes provider-facing minimal models ---
 class HermesSearchRequest(BaseModel):

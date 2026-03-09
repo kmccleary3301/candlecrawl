@@ -9,9 +9,20 @@ from app.models import FirecrawlDocument
 client = TestClient(app)
 
 def test_health_check():
-    response = client.get("/health")
+    with patch("app.main.scraper.get_browser_runtime_status", return_value={"browser_ready": False, "browser_error": "missing browser"}):
+        response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["browserReady"] is False
+    assert response.json()["browserError"] == "missing browser"
+
+def test_health_check_healthy_when_browser_ready():
+    with patch("app.main.scraper.get_browser_runtime_status", return_value={"browser_ready": True, "browser_error": None}):
+        response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
+    assert response.json()["browserReady"] is True
+    assert response.json()["browserError"] is None
 
 def test_scrape_success():
     with patch("app.main.scraper.scrape_url", new_callable=AsyncMock) as mock_scrape:

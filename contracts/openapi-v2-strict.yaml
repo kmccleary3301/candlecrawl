@@ -78,97 +78,6 @@ components:
           type: boolean
       title: ActionsCapabilitiesResponse
       type: object
-    BatchScrapeRequest:
-      properties:
-        exclude_tags:
-          anyOf:
-          - items:
-              type: string
-            type: array
-          - type: 'null'
-          title: Exclude Tags
-        formats:
-          anyOf:
-          - items:
-              enum:
-              - markdown
-              - html
-              - rawHtml
-              - content
-              - links
-              - screenshot
-              type: string
-            type: array
-          - type: 'null'
-          default:
-          - markdown
-          title: Formats
-        headers:
-          anyOf:
-          - additionalProperties:
-              type: string
-            type: object
-          - type: 'null'
-          title: Headers
-        include_file_body:
-          default: false
-          title: Include File Body
-          type: boolean
-        include_tags:
-          anyOf:
-          - items:
-              type: string
-            type: array
-          - type: 'null'
-          title: Include Tags
-        location:
-          anyOf:
-          - $ref: '#/components/schemas/LocationConfig'
-          - type: 'null'
-        max_concurrency:
-          default: 5
-          title: Max Concurrency
-          type: integer
-        mobile:
-          default: false
-          title: Mobile
-          type: boolean
-        only_main_content:
-          default: false
-          title: Only Main Content
-          type: boolean
-        remove_base64_images:
-          default: true
-          title: Remove Base64 Images
-          type: boolean
-        skip_tls_verification:
-          default: false
-          title: Skip Tls Verification
-          type: boolean
-        timeout:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          title: Timeout
-        urls:
-          items:
-            type: string
-          title: Urls
-          type: array
-        use_relative_links:
-          default: false
-          title: Use Relative Links
-          type: boolean
-        wait_for:
-          anyOf:
-          - type: integer
-          - type: number
-          - type: 'null'
-          title: Wait For
-      required:
-      - urls
-      title: BatchScrapeRequest
-      type: object
     BatchScrapeResponse:
       properties:
         error:
@@ -199,107 +108,19 @@ components:
           title: Url
       title: BatchScrapeResponse
       type: object
-    CrawlRequest:
+    CancelResponse:
+      additionalProperties: true
       properties:
-        allow_backward_links:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          title: Allow Backward Links
-        allow_external_links:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          default: false
-          title: Allow External Links
-        deduplicate_similar_urls:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          default: false
-          title: Deduplicate Similar Urls
-        delay:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          default: 0
-          title: Delay
-        exclude_paths:
-          anyOf:
-          - items:
-              type: string
-            type: array
-          - type: 'null'
-          title: Exclude Paths
-        ignore_query_parameters:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          default: false
-          title: Ignore Query Parameters
-        ignore_sitemap:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          default: false
-          title: Ignore Sitemap
-        include_paths:
-          anyOf:
-          - items:
-              type: string
-            type: array
-          - type: 'null'
-          title: Include Paths
-        include_subdomains:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          default: false
-          title: Include Subdomains
-        limit:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          default: 50
-          title: Limit
-        max_bytes:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          title: Max Bytes
-        max_concurrency:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          default: 10
-          title: Max Concurrency
-        max_depth:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          default: 2
-          title: Max Depth
-        max_time:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          title: Max Time
-        scrape_options:
-          anyOf:
-          - $ref: '#/components/schemas/ScrapeOptions'
-          - type: 'null'
-        url:
-          title: Url
-          type: string
-        webhook:
+        message:
           anyOf:
           - type: string
-          - $ref: '#/components/schemas/WebhookConfig'
           - type: 'null'
-          title: Webhook
-      required:
-      - url
-      title: CrawlRequest
+          title: Message
+        success:
+          default: true
+          title: Success
+          type: boolean
+      title: CancelResponse
       type: object
     CrawlResponse:
       properties:
@@ -430,6 +251,46 @@ components:
           title: Title
       title: DocumentMetadata
       type: object
+    ExtractRequest:
+      additionalProperties: true
+      properties:
+        enableWebSearch:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Enablewebsearch
+        ignoreSitemap:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Ignoresitemap
+        prompt:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Prompt
+        schema:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Schema
+        showSources:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Showsources
+        urls:
+          items:
+            type: string
+          title: Urls
+          type: array
+        webhook:
+          title: Webhook
+      required:
+      - urls
+      title: ExtractRequest
+      type: object
     FirecrawlDocument:
       properties:
         content_base64:
@@ -509,6 +370,82 @@ components:
           type: string
       title: HealthResponse
       type: object
+    JobCreateResponse:
+      additionalProperties: true
+      properties:
+        id:
+          title: Id
+          type: string
+        success:
+          default: true
+          title: Success
+          type: boolean
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Url
+        warning:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Warning
+      required:
+      - id
+      title: JobCreateResponse
+      type: object
+    JobErrorsResponse:
+      additionalProperties: true
+      properties:
+        errors:
+          items: {}
+          title: Errors
+          type: array
+        robotsBlocked:
+          items:
+            type: string
+          title: Robotsblocked
+          type: array
+      title: JobErrorsResponse
+      type: object
+    JobStatusResponse:
+      additionalProperties: true
+      properties:
+        completed:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Completed
+        creditsUsed:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Creditsused
+        data:
+          anyOf:
+          - items: {}
+            type: array
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Data
+        next:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next
+        status:
+          title: Status
+          type: string
+        total:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Total
+      required:
+      - status
+      title: JobStatusResponse
+      type: object
     LocationConfig:
       properties:
         country:
@@ -524,58 +461,6 @@ components:
           - type: 'null'
           title: Languages
       title: LocationConfig
-      type: object
-    MapRequest:
-      properties:
-        ignore_sitemap:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          default: false
-          title: Ignore Sitemap
-        include_subdomains:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          default: false
-          title: Include Subdomains
-        limit:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          default: 5000
-          title: Limit
-        search:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Search
-        url:
-          title: Url
-          type: string
-      required:
-      - url
-      title: MapRequest
-      type: object
-    MapResponse:
-      properties:
-        error:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Error
-        links:
-          anyOf:
-          - items:
-              type: string
-            type: array
-          - type: 'null'
-          title: Links
-        success:
-          default: true
-          title: Success
-          type: boolean
-      title: MapResponse
       type: object
     ScrapeAction:
       properties:
@@ -757,7 +642,374 @@ components:
           title: Wait For
       title: ScrapeOptions
       type: object
-    ScrapeRequest:
+    SearchRequest:
+      additionalProperties: true
+      properties:
+        categories:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Categories
+        country:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Country
+        lang:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Lang
+        limit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Limit
+        location:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Location
+        query:
+          title: Query
+          type: string
+        scrapeOptions:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Scrapeoptions
+        sources:
+          anyOf:
+          - items: {}
+            type: array
+          - type: 'null'
+          title: Sources
+      required:
+      - query
+      title: SearchRequest
+      type: object
+    SearchResponse:
+      additionalProperties: true
+      properties:
+        creditsUsed:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Creditsused
+        data:
+          additionalProperties: true
+          title: Data
+          type: object
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Id
+        success:
+          default: true
+          title: Success
+          type: boolean
+        warning:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Warning
+      title: SearchResponse
+      type: object
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          title: Location
+          type: array
+        msg:
+          title: Message
+          type: string
+        type:
+          title: Error Type
+          type: string
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+      type: object
+    WebhookConfig:
+      properties:
+        headers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Headers
+        metadata:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Metadata
+        url:
+          title: Url
+          type: string
+      required:
+      - url
+      title: WebhookConfig
+      type: object
+    candlecrawl___server__models__BatchScrapeRequest:
+      properties:
+        exclude_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Exclude Tags
+        formats:
+          anyOf:
+          - items:
+              enum:
+              - markdown
+              - html
+              - rawHtml
+              - content
+              - links
+              - screenshot
+              type: string
+            type: array
+          - type: 'null'
+          default:
+          - markdown
+          title: Formats
+        headers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Headers
+        include_file_body:
+          default: false
+          title: Include File Body
+          type: boolean
+        include_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Include Tags
+        location:
+          anyOf:
+          - $ref: '#/components/schemas/LocationConfig'
+          - type: 'null'
+        max_concurrency:
+          default: 5
+          title: Max Concurrency
+          type: integer
+        mobile:
+          default: false
+          title: Mobile
+          type: boolean
+        only_main_content:
+          default: false
+          title: Only Main Content
+          type: boolean
+        remove_base64_images:
+          default: true
+          title: Remove Base64 Images
+          type: boolean
+        skip_tls_verification:
+          default: false
+          title: Skip Tls Verification
+          type: boolean
+        timeout:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Timeout
+        urls:
+          items:
+            type: string
+          title: Urls
+          type: array
+        use_relative_links:
+          default: false
+          title: Use Relative Links
+          type: boolean
+        wait_for:
+          anyOf:
+          - type: integer
+          - type: number
+          - type: 'null'
+          title: Wait For
+      required:
+      - urls
+      title: BatchScrapeRequest
+      type: object
+    candlecrawl___server__models__CrawlRequest:
+      properties:
+        allow_backward_links:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Allow Backward Links
+        allow_external_links:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Allow External Links
+        deduplicate_similar_urls:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Deduplicate Similar Urls
+        delay:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 0
+          title: Delay
+        exclude_paths:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Exclude Paths
+        ignore_query_parameters:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Ignore Query Parameters
+        ignore_sitemap:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Ignore Sitemap
+        include_paths:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Include Paths
+        include_subdomains:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Include Subdomains
+        limit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 50
+          title: Limit
+        max_bytes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Max Bytes
+        max_concurrency:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 10
+          title: Max Concurrency
+        max_depth:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 2
+          title: Max Depth
+        max_time:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Max Time
+        scrape_options:
+          anyOf:
+          - $ref: '#/components/schemas/ScrapeOptions'
+          - type: 'null'
+        url:
+          title: Url
+          type: string
+        webhook:
+          anyOf:
+          - type: string
+          - $ref: '#/components/schemas/WebhookConfig'
+          - type: 'null'
+          title: Webhook
+      required:
+      - url
+      title: CrawlRequest
+      type: object
+    candlecrawl___server__models__MapRequest:
+      properties:
+        ignore_sitemap:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Ignore Sitemap
+        include_subdomains:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Include Subdomains
+        limit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 5000
+          title: Limit
+        search:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Search
+        url:
+          title: Url
+          type: string
+      required:
+      - url
+      title: MapRequest
+      type: object
+    candlecrawl___server__models__MapResponse:
+      properties:
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        links:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Links
+        success:
+          default: true
+          title: Success
+          type: boolean
+      title: MapResponse
+      type: object
+    candlecrawl___server__models__ScrapeRequest:
       properties:
         exclude_tags:
           anyOf:
@@ -853,7 +1105,7 @@ components:
       - url
       title: ScrapeRequest
       type: object
-    ScrapeResponse:
+    candlecrawl___server__models__ScrapeResponse:
       properties:
         data:
           anyOf:
@@ -875,49 +1127,172 @@ components:
           title: Warning
       title: ScrapeResponse
       type: object
-    ValidationError:
+    candlecrawl__schemas__BatchScrapeRequest:
+      additionalProperties: true
       properties:
-        loc:
+        scrapeOptions:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Scrapeoptions
+        urls:
           items:
-            anyOf:
-            - type: string
-            - type: integer
-          title: Location
+            type: string
+          title: Urls
           type: array
-        msg:
-          title: Message
-          type: string
-        type:
-          title: Error Type
-          type: string
+        webhook:
+          title: Webhook
       required:
-      - loc
-      - msg
-      - type
-      title: ValidationError
+      - urls
+      title: BatchScrapeRequest
       type: object
-    WebhookConfig:
+    candlecrawl__schemas__CrawlRequest:
+      additionalProperties: true
       properties:
-        headers:
+        limit:
           anyOf:
-          - additionalProperties:
-              type: string
+          - type: integer
+          - type: 'null'
+          title: Limit
+        maxDepth:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Maxdepth
+        scrapeOptions:
+          anyOf:
+          - additionalProperties: true
             type: object
           - type: 'null'
-          title: Headers
-        metadata:
+          title: Scrapeoptions
+        url:
+          title: Url
+          type: string
+        webhook:
+          title: Webhook
+      required:
+      - url
+      title: CrawlRequest
+      type: object
+    candlecrawl__schemas__MapRequest:
+      additionalProperties: true
+      properties:
+        includeSubdomains:
           anyOf:
-          - additionalProperties:
-              type: string
-            type: object
+          - type: boolean
           - type: 'null'
-          title: Metadata
+          title: Includesubdomains
+        limit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Limit
+        search:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Search
         url:
           title: Url
           type: string
       required:
       - url
-      title: WebhookConfig
+      title: MapRequest
+      type: object
+    candlecrawl__schemas__MapResponse:
+      additionalProperties: true
+      properties:
+        creditsUsed:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Creditsused
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Id
+        links:
+          items: {}
+          title: Links
+          type: array
+        success:
+          default: true
+          title: Success
+          type: boolean
+        warning:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Warning
+      title: MapResponse
+      type: object
+    candlecrawl__schemas__ScrapeRequest:
+      additionalProperties: true
+      properties:
+        actions:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Actions
+        formats:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Formats
+        onlyMainContent:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Onlymaincontent
+        options:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Options
+        url:
+          title: Url
+          type: string
+      required:
+      - url
+      title: ScrapeRequest
+      type: object
+    candlecrawl__schemas__ScrapeResponse:
+      additionalProperties: true
+      properties:
+        creditsUsed:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Creditsused
+        data:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Data
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Id
+        success:
+          default: true
+          title: Success
+          type: boolean
+        warning:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Warning
+      title: ScrapeResponse
       type: object
 info:
   description: Self-hosted web scraping and crawling service
@@ -956,7 +1331,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/BatchScrapeRequest'
+              $ref: '#/components/schemas/candlecrawl___server__models__BatchScrapeRequest'
         required: true
       responses:
         '200':
@@ -1004,7 +1379,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CrawlRequest'
+              $ref: '#/components/schemas/candlecrawl___server__models__CrawlRequest'
         required: true
       responses:
         '200':
@@ -1108,14 +1483,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/MapRequest'
+              $ref: '#/components/schemas/candlecrawl___server__models__MapRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MapResponse'
+                $ref: '#/components/schemas/candlecrawl___server__models__MapResponse'
           description: Successful Response
         '422':
           content:
@@ -1132,14 +1507,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ScrapeRequest'
+              $ref: '#/components/schemas/candlecrawl___server__models__ScrapeRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ScrapeResponse'
+                $ref: '#/components/schemas/candlecrawl___server__models__ScrapeResponse'
           description: Successful Response
         '422':
           content:
@@ -1156,7 +1531,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/BatchScrapeRequest'
+              $ref: '#/components/schemas/candlecrawl___server__models__BatchScrapeRequest'
         required: true
       responses:
         '200':
@@ -1164,7 +1539,7 @@ paths:
             application/json:
               schema:
                 items:
-                  $ref: '#/components/schemas/ScrapeResponse'
+                  $ref: '#/components/schemas/candlecrawl___server__models__ScrapeResponse'
                 title: Response Bulk Scrape V1 Scrape Bulk Post
                 type: array
           description: Successful Response
@@ -1191,7 +1566,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ScrapeResponse'
+                $ref: '#/components/schemas/candlecrawl___server__models__ScrapeResponse'
           description: Successful Response
         '422':
           content:
@@ -1218,15 +1593,14 @@ paths:
         content:
           application/json:
             schema:
-              additionalProperties: true
-              title: Payload
-              type: object
+              $ref: '#/components/schemas/candlecrawl__schemas__BatchScrapeRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobCreateResponse'
           description: Successful Response
         '422':
           content:
@@ -1249,7 +1623,8 @@ paths:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/CancelResponse'
           description: Successful Response
         '422':
           content:
@@ -1271,7 +1646,8 @@ paths:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
           description: Successful Response
         '422':
           content:
@@ -1294,7 +1670,8 @@ paths:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobErrorsResponse'
           description: Successful Response
         '422':
           content:
@@ -1310,15 +1687,14 @@ paths:
         content:
           application/json:
             schema:
-              additionalProperties: true
-              title: Payload
-              type: object
+              $ref: '#/components/schemas/candlecrawl__schemas__CrawlRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobCreateResponse'
           description: Successful Response
         '422':
           content:
@@ -1341,7 +1717,8 @@ paths:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/CancelResponse'
           description: Successful Response
         '422':
           content:
@@ -1363,7 +1740,8 @@ paths:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
           description: Successful Response
         '422':
           content:
@@ -1386,7 +1764,8 @@ paths:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobErrorsResponse'
           description: Successful Response
         '422':
           content:
@@ -1402,15 +1781,14 @@ paths:
         content:
           application/json:
             schema:
-              additionalProperties: true
-              title: Payload
-              type: object
+              $ref: '#/components/schemas/ExtractRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobCreateResponse'
           description: Successful Response
         '422':
           content:
@@ -1433,7 +1811,8 @@ paths:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
           description: Successful Response
         '422':
           content:
@@ -1449,15 +1828,14 @@ paths:
         content:
           application/json:
             schema:
-              additionalProperties: true
-              title: Payload
-              type: object
+              $ref: '#/components/schemas/candlecrawl__schemas__MapRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/candlecrawl__schemas__MapResponse'
           description: Successful Response
         '422':
           content:
@@ -1473,15 +1851,14 @@ paths:
         content:
           application/json:
             schema:
-              additionalProperties: true
-              title: Payload
-              type: object
+              $ref: '#/components/schemas/candlecrawl__schemas__ScrapeRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/candlecrawl__schemas__ScrapeResponse'
           description: Successful Response
         '422':
           content:
@@ -1497,15 +1874,14 @@ paths:
         content:
           application/json:
             schema:
-              additionalProperties: true
-              title: Payload
-              type: object
+              $ref: '#/components/schemas/SearchRequest'
         required: true
       responses:
         '200':
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
           description: Successful Response
         '422':
           content:

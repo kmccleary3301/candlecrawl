@@ -25,7 +25,7 @@ def _missing_service_extra(exc: Exception) -> SystemExit:
 
 def _load_server_app() -> tuple[Any, Any]:
     try:
-        module = importlib.import_module("app.main")
+        module = importlib.import_module("candlecrawl._server.main")
     except Exception as exc:  # pragma: no cover - exact optional dependency varies by environment
         raise _missing_service_extra(exc) from exc
     return module.app, getattr(module, "settings", None)
@@ -44,7 +44,7 @@ def command_serve(args: argparse.Namespace) -> int:
 
     _load_server_app()
     uvicorn.run(
-        "app.main:app",
+        "candlecrawl._server.main:app",
         host=args.host,
         port=args.port,
         log_level=args.log_level,
@@ -110,7 +110,7 @@ def collect_doctor_checks() -> dict[str, bool]:
         "PIL": _can_import("PIL"),
         "redis": _can_import("redis"),
     }
-    checks["service_import"] = _can_import("app.main")
+    checks["service_import"] = _can_import("candlecrawl._server.main")
     checks["provider_keys_present"] = any(
         bool(os.getenv(name))
         for name in ("SERPER_DEV_API_KEY", "SCRAPE_DO_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")

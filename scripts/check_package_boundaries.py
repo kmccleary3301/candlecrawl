@@ -71,6 +71,8 @@ def check_artifacts() -> list[str]:
         members = _artifact_members(path)
         for member in members:
             normalized = member.replace("\\", "/").lower()
+            if normalized.startswith("app/") or "/app/" in normalized:
+                errors.append(f"{path.name} contains top-level legacy app package member {member}")
             for forbidden in FORBIDDEN_ARTIFACT_SUBSTRINGS:
                 if forbidden.lower() in normalized:
                     errors.append(f"{path.name} contains forbidden artifact member {member}")

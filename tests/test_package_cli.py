@@ -37,6 +37,13 @@ def test_public_import_does_not_import_legacy_server_app() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_cli_service_import_targets_private_server_package() -> None:
+    from candlecrawl import cli
+
+    assert cli.collect_doctor_checks()["service_import"] is True
+    assert cli._load_server_app()[0] is not None
+
+
 def test_cli_version(capsys) -> None:
     from candlecrawl.cli import main
 

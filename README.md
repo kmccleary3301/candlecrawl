@@ -96,10 +96,10 @@ cd candlecrawl
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e ".[service,browser,pdf,ocr,test]"
 
 python -m playwright install chromium
-python -m uvicorn app.main:app --host 0.0.0.0 --port 3010
+candlecrawl serve --host 0.0.0.0 --port 3010
 ```
 
 ### Package-Oriented Development
@@ -125,10 +125,10 @@ pip install -e .
 python -c "import candlecrawl, candlecrawl.client; print(candlecrawl.__version__)"
 ```
 
-The package CLI is the preferred integration direction for downstream systems.
-Direct `uvicorn app.main:app` remains available as a legacy development path
-while the server internals are being moved behind the public `candlecrawl`
-package boundary.
+The package CLI is the integration boundary for downstream systems. Service
+runtime code is packaged under the private `candlecrawl._server` namespace;
+top-level `app` is kept only in the repository as a development compatibility
+shim for older tests and scripts.
 
 SDK smoke:
 

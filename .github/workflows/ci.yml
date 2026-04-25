@@ -40,8 +40,10 @@ jobs:
           python -m venv /tmp/candlecrawl-wheel-smoke
           /tmp/candlecrawl-wheel-smoke/bin/python -m pip install --upgrade pip
           /tmp/candlecrawl-wheel-smoke/bin/python -m pip install 'dist/candlecrawl-0.1.0a1-py3-none-any.whl[service,browser,pdf,ocr]'
+          cd /tmp
           /tmp/candlecrawl-wheel-smoke/bin/python - <<'PY'
           import sys
+          import importlib.util
           import candlecrawl
           import candlecrawl.client
           import candlecrawl.errors
@@ -50,11 +52,18 @@ jobs:
 
           assert candlecrawl.__version__
           assert "app.main" not in sys.modules
+          assert "candlecrawl._server.main" not in sys.modules
+          assert importlib.util.find_spec("app") is None
           PY
           /tmp/candlecrawl-wheel-smoke/bin/candlecrawl version
           /tmp/candlecrawl-wheel-smoke/bin/candlecrawl doctor
           /tmp/candlecrawl-wheel-smoke/bin/candlecrawl export-openapi --strict-v2 --output /tmp/candlecrawl-openapi.yaml
           test -s /tmp/candlecrawl-openapi.yaml
+          /tmp/candlecrawl-wheel-smoke/bin/python - <<'PY'
+          import importlib.util
+
+          assert importlib.util.find_spec("candlecrawl._server.main") is not None
+          PY
 
   contract-validation:
     runs-on: ubuntu-latest

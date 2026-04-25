@@ -34,7 +34,9 @@ tmpdir="$(mktemp -d)"
 python -m venv "${tmpdir}/venv"
 "${tmpdir}/venv/bin/python" -m pip install --upgrade pip
 "${tmpdir}/venv/bin/python" -m pip install dist/candlecrawl-*.whl
+cd "${tmpdir}"
 "${tmpdir}/venv/bin/python" - <<'PY'
+import importlib.util
 import sys
 from candlecrawl import AsyncCandleCrawlClient, CandleCrawlClient
 import candlecrawl.client
@@ -45,6 +47,8 @@ import candlecrawl.trace
 assert AsyncCandleCrawlClient
 assert CandleCrawlClient
 assert "app.main" not in sys.modules
+assert "candlecrawl._server.main" not in sys.modules
+assert importlib.util.find_spec("app") is None
 PY
 rm -rf "${tmpdir}"
 ```
@@ -56,17 +60,50 @@ tmpdir="$(mktemp -d)"
 python -m venv "${tmpdir}/venv"
 "${tmpdir}/venv/bin/python" -m pip install --upgrade pip
 "${tmpdir}/venv/bin/python" -m pip install 'dist/candlecrawl-*.whl[service,browser,pdf,ocr]'
+cd "${tmpdir}"
 "${tmpdir}/venv/bin/candlecrawl" doctor
 "${tmpdir}/venv/bin/candlecrawl" export-openapi --strict-v2 --output "${tmpdir}/openapi.yaml"
+"${tmpdir}/venv/bin/python" - <<'PY'
+import importlib.util
+
+assert importlib.util.find_spec("app") is None
+assert importlib.util.find_spec("candlecrawl._server.main") is not None
+PY
 rm -rf "${tmpdir}"
 ```
 
+## Publish Dry Run
+
+Use TestPyPI or a private package index before any public promotion:
+
+```bash
+python -m twine upload --repository testpypi dist/*
+tmpdir="$(mktemp -d)"
+python -m venv "${tmpdir}/venv"
+"${tmpdir}/venv/bin/python" -m pip install --upgrade pip
+"${tmpdir}/venv/bin/python" -m pip install \
+  --index-url https://test.pypi.org/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  "candlecrawl==$(python - <<'PY'
+from candlecrawl import __version__
+print(__version__)
+PY
+)"
+"${tmpdir}/venv/bin/candlecrawl" version
+rm -rf "${tmpdir}"
+```
+
+Do not promote a public package until the TestPyPI/private-index install and
+Hermes candidate compatibility checks both pass.
+
 ## Versioning
 
-- Alpha package versions are acceptable while the top-level `app` server package
-  is still being migrated behind `candlecrawl._server`.
+- Alpha package versions are acceptable while the repository keeps top-level
+  `app` as a development compatibility shim. Release artifacts must package the
+  service runtime under `candlecrawl._server` and must not include top-level
+  `app`.
 - Do not cut a stable public PyPI release until:
-  - the server package relocation is complete or explicitly deferred,
+  - the private `candlecrawl._server` package path is validated from a clean wheel,
   - Hermes candidate compatibility passes against the accepted v2 contract,
   - release artifacts are free of legacy/private material,
   - rollback instructions are current.

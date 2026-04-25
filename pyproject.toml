@@ -82,7 +82,7 @@ package-dir = { "candlecrawl" = "src/candlecrawl" }
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
-include = ["candlecrawl*", "app*"]
+include = ["candlecrawl*"]
 namespaces = false
 
 [tool.pytest.ini_options]

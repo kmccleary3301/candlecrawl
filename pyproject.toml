@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "candlecrawl"
-version = "0.1.0a1"
+version = "0.1.0a4"
 description = "Self-hostable crawling, scraping, mapping, search, and extraction infrastructure."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,6 +41,9 @@ service = [
   "redis>=5,<6",
   "rq>=1.16,<2",
   "tiktoken>=0.8,<0.9",
+  "playwright>=1.45,<2",
+  "pypdf>=6.7,<7",
+  "Pillow>=12,<13",
 ]
 browser = ["playwright>=1.45,<2"]
 pdf = ["pypdf>=6.7,<7"]

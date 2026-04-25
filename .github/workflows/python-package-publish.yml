@@ -1,0 +1,97 @@
+name: CandleCrawl Python Package Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Expected CandleCrawl version to publish, for example 0.1.0a5"
+        required: true
+        type: string
+      confirm_public_pypi:
+        description: "Type publish to confirm this uploads immutable files to public PyPI"
+        required: true
+        type: string
+  release:
+    types: [published]
+
+jobs:
+  pypi-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate requested version
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          test "${{ inputs.confirm_public_pypi }}" = "publish"
+          VERSION="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])
+          PY
+          )"
+          test "${VERSION}" = "${{ inputs.version }}"
+
+      - name: Build and validate release artifacts
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          python -m build
+          python -m twine check dist/*
+          python scripts/check_package_boundaries.py
+
+      - name: Clean service wheel smoke
+        run: |
+          WHEEL="$(ls dist/candlecrawl-*.whl)"
+          python -m venv /tmp/candlecrawl-release-smoke
+          /tmp/candlecrawl-release-smoke/bin/python -m pip install --upgrade pip
+          /tmp/candlecrawl-release-smoke/bin/python -m pip install "${WHEEL}[service]"
+          cd /tmp
+          /tmp/candlecrawl-release-smoke/bin/python - <<'PY'
+          import importlib.util
+          import sys
+
+          import candlecrawl
+          import candlecrawl.client
+          import candlecrawl.errors
+          import candlecrawl.schemas
+          import candlecrawl.trace
+
+          assert candlecrawl.__version__
+          assert "app.main" not in sys.modules
+          assert "candlecrawl._server.main" not in sys.modules
+          assert importlib.util.find_spec("app") is None
+          PY
+          /tmp/candlecrawl-release-smoke/bin/candlecrawl version
+          /tmp/candlecrawl-release-smoke/bin/candlecrawl export-openapi --strict-v2 --output /tmp/candlecrawl-release-openapi.yaml
+          test -s /tmp/candlecrawl-release-openapi.yaml
+
+      - name: Publish to PyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Verify install from PyPI
+        run: |
+          VERSION="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])
+          PY
+          )"
+          python -m venv /tmp/candlecrawl-pypi
+          /tmp/candlecrawl-pypi/bin/python -m pip install --upgrade pip
+          /tmp/candlecrawl-pypi/bin/python -m pip install \
+            --index-url https://pypi.org/simple/ \
+            --no-cache-dir \
+            --pre \
+            "candlecrawl[service]==${VERSION}"
+          /tmp/candlecrawl-pypi/bin/candlecrawl version
+          /tmp/candlecrawl-pypi/bin/candlecrawl export-openapi --strict-v2 --output /tmp/candlecrawl-pypi-openapi.yaml
+          test -s /tmp/candlecrawl-pypi-openapi.yaml

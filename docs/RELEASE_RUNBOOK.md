@@ -72,29 +72,66 @@ PY
 rm -rf "${tmpdir}"
 ```
 
+## Trusted Publishing Setup
+
+CandleCrawl should publish with PyPI Trusted Publishing through GitHub Actions,
+not with long-lived API tokens in local `.env` files.
+
+Repository-side requirements:
+
+- GitHub environments exist:
+  - `testpypi`
+  - `pypi`
+- Workflows request `id-token: write` and use
+  `pypa/gh-action-pypi-publish@release/v1`.
+- No `TWINE_PASSWORD`, `PYPI_API_TOKEN`, or project `.env` is required for the
+  normal path.
+
+PyPI-side requirements:
+
+- On TestPyPI, add a trusted publisher for:
+  - owner: `kmccleary3301`
+  - repository: `candlecrawl`
+  - workflow: `python-package-publish-dry-run.yml`
+  - environment: `testpypi`
+- On PyPI, add a trusted publisher for:
+  - owner: `kmccleary3301`
+  - repository: `candlecrawl`
+  - workflow: `python-package-publish.yml`
+  - environment: `pypi`
+
+PyPI releases are immutable. If any package smoke catches a miss after upload,
+fix it, bump the alpha version, and publish the next version.
+
 ## Publish Dry Run
 
 Use TestPyPI or a private package index before any public promotion:
 
-```bash
-python -m twine upload --repository testpypi dist/*
-tmpdir="$(mktemp -d)"
-python -m venv "${tmpdir}/venv"
-"${tmpdir}/venv/bin/python" -m pip install --upgrade pip
-"${tmpdir}/venv/bin/python" -m pip install \
-  --index-url https://test.pypi.org/simple/ \
-  --extra-index-url https://pypi.org/simple/ \
-  "candlecrawl==$(python - <<'PY'
-from candlecrawl import __version__
-print(__version__)
-PY
-)"
-"${tmpdir}/venv/bin/candlecrawl" version
-rm -rf "${tmpdir}"
-```
+1. Confirm the TestPyPI trusted publisher is configured.
+2. Run GitHub Actions workflow `CandleCrawl Python Package Publish Dry Run`.
+3. Confirm the workflow installs `candlecrawl[service]` from TestPyPI and
+   exports OpenAPI from that installed package.
 
 Do not promote a public package until the TestPyPI/private-index install and
 Hermes candidate compatibility checks both pass.
+
+## Public PyPI Publish
+
+Use GitHub Actions workflow `CandleCrawl Python Package Publish`.
+
+For manual dispatch:
+
+1. Enter the exact version from `pyproject.toml`, for example `0.1.0a5`.
+2. Type `publish` in the confirmation input.
+3. Let the workflow build, validate, publish with Trusted Publishing, and then
+   reinstall from public PyPI.
+
+For release-triggered publishing, create a GitHub release only after local gates,
+TestPyPI, and Hermes compatibility have passed.
+
+Manual `twine upload` with a local token is an emergency-only fallback. If it is
+used, load the token from a private shell environment for that command only,
+never from a committed file or shared runtime configuration.
 
 ## Versioning
 

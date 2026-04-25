@@ -37,9 +37,10 @@ jobs:
           python scripts/check_package_boundaries.py
       - name: Clean wheel install and CLI smoke
         run: |
+          WHEEL="$(ls dist/candlecrawl-*.whl)"
           python -m venv /tmp/candlecrawl-wheel-smoke
           /tmp/candlecrawl-wheel-smoke/bin/python -m pip install --upgrade pip
-          /tmp/candlecrawl-wheel-smoke/bin/python -m pip install 'dist/candlecrawl-0.1.0a1-py3-none-any.whl[service,browser,pdf,ocr]'
+          /tmp/candlecrawl-wheel-smoke/bin/python -m pip install "${WHEEL}[service]"
           cd /tmp
           /tmp/candlecrawl-wheel-smoke/bin/python - <<'PY'
           import sys

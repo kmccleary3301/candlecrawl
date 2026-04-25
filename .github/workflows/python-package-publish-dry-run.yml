@@ -35,8 +35,9 @@ jobs:
       - name: Verify install from TestPyPI
         run: |
           VERSION="$(python - <<'PY'
-          from candlecrawl import __version__
-          print(__version__)
+          import tomllib
+          from pathlib import Path
+          print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])
           PY
           )"
           python -m venv /tmp/candlecrawl-testpypi
@@ -44,5 +45,7 @@ jobs:
           /tmp/candlecrawl-testpypi/bin/python -m pip install \
             --index-url https://test.pypi.org/simple/ \
             --extra-index-url https://pypi.org/simple/ \
-            "candlecrawl==${VERSION}"
+            "candlecrawl[service]==${VERSION}"
           /tmp/candlecrawl-testpypi/bin/candlecrawl version
+          /tmp/candlecrawl-testpypi/bin/candlecrawl export-openapi --strict-v2 --output /tmp/candlecrawl-testpypi-openapi.yaml
+          test -s /tmp/candlecrawl-testpypi-openapi.yaml

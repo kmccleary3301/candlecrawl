@@ -27,7 +27,7 @@ CandleCrawl is a self-hostable web ingestion service for teams that need more th
 - depth-aware crawling with politeness controls and export paths,
 - Firecrawl-style `v1` and `v2` compatibility surfaces,
 - provider-backed search and extraction helpers,
-- optional Hermes-facing BCAS and cost-tracking endpoints,
+- a retired Hermes compatibility surface kept out of package artifacts,
 - a repo structure intended to remain useful as a standalone system or as a substrate inside larger research stacks.
 
 The target audience here is not "people who want a demo". It is engineers, infra-minded researchers, and platform builders who need a service they can inspect, adapt, and embed into higher-level intelligence systems.
@@ -64,7 +64,7 @@ In practice the repo currently serves three adjacent roles:
 
 1. A standalone crawl/scrape/search/extract API.
 2. A Firecrawl-style compatibility layer for `v1` / `v2` request shapes.
-3. A provider-enabled substrate used by Hermes for BCAS-style research and enrichment flows.
+3. A provider-enabled substrate used by Hermes through service and SDK boundaries.
 
 ## Capability Snapshot
 
@@ -129,6 +129,19 @@ The package CLI is the preferred integration direction for downstream systems.
 Direct `uvicorn app.main:app` remains available as a legacy development path
 while the server internals are being moved behind the public `candlecrawl`
 package boundary.
+
+SDK smoke:
+
+```python
+from candlecrawl import AsyncCandleCrawlClient
+from candlecrawl.schemas import ScrapeRequest
+
+async with AsyncCandleCrawlClient(base_url="http://127.0.0.1:3010") as client:
+    result = await client.scrape(
+        ScrapeRequest(url="https://example.com", formats=["markdown", "links"])
+    )
+    print(result.data)
+```
 
 Health check:
 
@@ -248,7 +261,7 @@ Scrape and crawl requests support:
 | --- | --- |
 | `v1/*` | Lightweight Firecrawl-style compatibility and existing callers |
 | `v2/*` | Cleaner evolving contract surface |
-| `/v1/hermes/*` | Internal compatibility bridge for Hermes research and enrichment flows |
+| `/v1/hermes/*` | Retired compatibility surface; returns 410 |
 
 ## API Surface
 
@@ -572,6 +585,7 @@ CandleCrawl follows semantic versioning. See [VERSIONING.md](./VERSIONING.md).
 | [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) | Setup, env vars, first boot, smoke checks |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Runtime design, module responsibilities, queue and render model |
 | [docs/API_AND_OPERATIONS.md](./docs/API_AND_OPERATIONS.md) | Endpoint catalog, request examples, health and troubleshooting |
+| [docs/RELEASE_RUNBOOK.md](./docs/RELEASE_RUNBOOK.md) | Package, contract, clean-install, and Hermes candidate release gates |
 | [QueryLake_Integration_Plan.md](./QueryLake_Integration_Plan.md) | Planned QueryLake/Ray alignment |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | Contribution workflow and contract-change discipline |
 | [CHANGELOG.md](./CHANGELOG.md) | Release history |

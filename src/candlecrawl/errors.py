@@ -42,3 +42,7 @@ class CandleCrawlNotFoundError(CandleCrawlAPIError):
 
 class CandleCrawlContractError(CandleCrawlError):
     pass
+
+
+class CandleCrawlCompatibilityError(CandleCrawlError):
+    pass

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import os
 import subprocess
 import sys
@@ -18,11 +17,24 @@ def test_public_package_imports_are_lightweight() -> None:
 
 
 def test_public_import_does_not_import_legacy_server_app() -> None:
-    sys.modules.pop("app.main", None)
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + str(repo_root)
 
-    importlib.import_module("candlecrawl")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, candlecrawl; raise SystemExit(1 if 'app.main' in sys.modules else 0)",
+        ],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    assert "app.main" not in sys.modules
+    assert result.returncode == 0, result.stderr
 
 
 def test_cli_version(capsys) -> None:

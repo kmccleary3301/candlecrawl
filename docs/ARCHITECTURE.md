@@ -34,7 +34,7 @@ HTTP request
 | `app/http_client.py` | Retry/backoff HTTP wrapper |
 | `app/config.py` | Runtime settings and environment parsing |
 | `app/providers/*` | Search, scrape fallback, and LLM provider clients |
-| `app/hermes_bcas.py` | BCAS research bridge used by Hermes-facing routes |
+| `legacy/hermes_bcas.py` | Quarantined historical BCAS bridge; not included in installable packages |
 | `app/cost_tracking.py` | Provider and stage-level cost accounting |
 
 ## Scraping Strategy

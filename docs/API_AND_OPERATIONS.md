@@ -20,16 +20,11 @@ This document is the operational companion to the README. It focuses on endpoint
 | `/v2/search` | `POST` | Provider-backed search |
 | `/v2/extract` | `POST` | Multi-URL scrape/extract surface |
 
-### Hermes bridge
+### Retired Hermes bridge
 
 | Endpoint | Method | Notes |
 | --- | --- | --- |
-| `/v1/hermes/leads/search` | `POST` | Serper-backed lead/entity search |
-| `/v1/hermes/leads/enrich` | `POST` | Domain enrichment by scraping |
-| `/v1/hermes/external-scrape` | `POST` | Scrape.do-backed fallback |
-| `/v1/hermes/compose` | `POST` | OpenRouter-backed composition |
-| `/v1/hermes/research` | `POST` | BCAS research flow |
-| `/v1/hermes/costs/*` | `GET` | Cost telemetry |
+| `/v1/hermes/*` | varied | Retired compatibility surface; use Hermes-owned APIs for higher-level research workflows |
 
 ## Health Semantics
 

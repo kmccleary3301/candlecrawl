@@ -81,7 +81,7 @@ In practice the repo currently serves three adjacent roles:
 | Crawl politeness | 🟢 | robots.txt, crawl delay, path rules, budgets | Designed for extension, not just happy path demos |
 | Provider abstraction | 🟢 | Serper, Scrape.do, OpenRouter | Useful both standalone and for Hermes integration |
 | Cost telemetry | 🟢 | `/v1/hermes/costs/*` | Research-job oriented, not generic billing |
-| Hermes BCAS research | 🟡 | `/v1/hermes/research` and helpers | Powerful, but still a compatibility/bridge surface |
+| Hermes BCAS research | ⚪ | retired `/v1/hermes/*` compatibility routes | Historical bridge code is quarantined under `legacy/` and is not packaged |
 | Public contract discipline | 🟡 | `contracts/openapi-v1.yaml` | Draft contract, versioned intentionally |
 | Distributed frontier | 🔵 | `MemoryFrontier` today | Redis/Ray-ready direction documented, not fully shipped |
 
@@ -284,16 +284,11 @@ Scrape and crawl requests support:
 
 ### Hermes Bridge Endpoints
 
-These are not the main public story of CandleCrawl, but they are real and useful.
+These are not the main public story of CandleCrawl. The former Hermes bridge routes are retired and return a 410 compatibility envelope.
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
-| `/v1/hermes/leads/search` | `POST` | Search via Serper for lead/entity discovery |
-| `/v1/hermes/leads/enrich` | `POST` | Scrape/enrich a set of domains |
-| `/v1/hermes/external-scrape` | `POST` | Provider-backed fallback scrape |
-| `/v1/hermes/compose` | `POST` | LLM composition helper |
-| `/v1/hermes/research` | `POST` | BCAS-style research orchestration |
-| `/v1/hermes/costs/*` | `GET` | Cost and provider-usage telemetry |
+| `/v1/hermes/*` | varied | Retired compatibility surface; use Hermes-owned APIs for higher-level research workflows |
 
 ### Contract Artifact
 
@@ -397,7 +392,7 @@ curl -sS http://127.0.0.1:3010/v2/extract \
   }'
 ```
 
-### 7. Hermes BCAS research call
+### 7. Retired Hermes BCAS research call
 
 ```bash
 curl -sS http://127.0.0.1:3010/v1/hermes/research \
@@ -494,12 +489,13 @@ candlecrawl/
 │   ├── cost_endpoints.py        # Hermes cost telemetry API
 │   ├── model_pricing.py         # Model cost estimation helpers
 │   ├── chunking.py              # Search/research-oriented chunking helpers
-│   ├── hermes_bcas.py           # BCAS-style research orchestration bridge
 │   ├── providers/
 │   │   ├── base.py              # Shared provider exception types
 │   │   ├── serper.py            # Search/news/image provider client
 │   │   ├── scrapedo.py          # Scrape.do fallback client
 │   │   └── openrouter.py        # LLM provider client for BCAS and compose flows
+├── legacy/
+│   └── hermes_bcas.py           # quarantined historical BCAS bridge; not packaged
 │   └── scripts/
 │       └── provider_smoketests.py
 ├── contracts/

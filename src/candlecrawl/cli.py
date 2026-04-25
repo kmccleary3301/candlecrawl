@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,12 @@ def command_export_openapi(args: argparse.Namespace) -> int:
 
 
 def command_doctor(_args: argparse.Namespace) -> int:
+    checks = collect_doctor_checks()
+    print(json.dumps(checks, indent=2, sort_keys=True))
+    return 0 if checks["httpx"] and checks["pydantic"] else 1
+
+
+def collect_doctor_checks() -> dict[str, bool]:
     checks = {
         "package": True,
         "httpx": _can_import("httpx"),
@@ -103,8 +110,12 @@ def command_doctor(_args: argparse.Namespace) -> int:
         "PIL": _can_import("PIL"),
         "redis": _can_import("redis"),
     }
-    print(json.dumps(checks, indent=2, sort_keys=True))
-    return 0 if checks["httpx"] and checks["pydantic"] else 1
+    checks["service_import"] = _can_import("app.main")
+    checks["provider_keys_present"] = any(
+        bool(os.getenv(name))
+        for name in ("SERPER_DEV_API_KEY", "SCRAPE_DO_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
+    )
+    return checks
 
 
 def _can_import(module_name: str) -> bool:

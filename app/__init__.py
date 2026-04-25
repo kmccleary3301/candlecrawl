@@ -2,6 +2,7 @@
 
 __all__ = [
     "config",
+    "artifacts",
     "frontier",
     "http_client",
     "providers",

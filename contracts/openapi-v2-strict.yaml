@@ -1,0 +1,1516 @@
+components:
+  schemas:
+    ActionCapability:
+      properties:
+        aliases:
+          items:
+            type: string
+          title: Aliases
+          type: array
+        notes:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Notes
+        outputs:
+          items:
+            type: string
+          title: Outputs
+          type: array
+        requestFields:
+          items:
+            $ref: '#/components/schemas/ActionFieldCapability'
+          title: Requestfields
+          type: array
+        type:
+          title: Type
+          type: string
+      required:
+      - type
+      title: ActionCapability
+      type: object
+    ActionFieldCapability:
+      properties:
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        name:
+          title: Name
+          type: string
+        required:
+          default: false
+          title: Required
+          type: boolean
+        valueType:
+          title: Valuetype
+          type: string
+      required:
+      - name
+      - valueType
+      title: ActionFieldCapability
+      type: object
+    ActionsCapabilitiesResponse:
+      properties:
+        actions:
+          items:
+            $ref: '#/components/schemas/ActionCapability'
+          title: Actions
+          type: array
+        contractVersion:
+          default: candlecrawl.actions.v1
+          title: Contractversion
+          type: string
+        documentedRequestFields:
+          items:
+            type: string
+          title: Documentedrequestfields
+          type: array
+        documentedResponseFields:
+          items:
+            type: string
+          title: Documentedresponsefields
+          type: array
+        success:
+          default: true
+          title: Success
+          type: boolean
+      title: ActionsCapabilitiesResponse
+      type: object
+    BatchScrapeRequest:
+      properties:
+        exclude_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Exclude Tags
+        formats:
+          anyOf:
+          - items:
+              enum:
+              - markdown
+              - html
+              - rawHtml
+              - content
+              - links
+              - screenshot
+              type: string
+            type: array
+          - type: 'null'
+          default:
+          - markdown
+          title: Formats
+        headers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Headers
+        include_file_body:
+          default: false
+          title: Include File Body
+          type: boolean
+        include_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Include Tags
+        location:
+          anyOf:
+          - $ref: '#/components/schemas/LocationConfig'
+          - type: 'null'
+        max_concurrency:
+          default: 5
+          title: Max Concurrency
+          type: integer
+        mobile:
+          default: false
+          title: Mobile
+          type: boolean
+        only_main_content:
+          default: false
+          title: Only Main Content
+          type: boolean
+        remove_base64_images:
+          default: true
+          title: Remove Base64 Images
+          type: boolean
+        skip_tls_verification:
+          default: false
+          title: Skip Tls Verification
+          type: boolean
+        timeout:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Timeout
+        urls:
+          items:
+            type: string
+          title: Urls
+          type: array
+        use_relative_links:
+          default: false
+          title: Use Relative Links
+          type: boolean
+        wait_for:
+          anyOf:
+          - type: integer
+          - type: number
+          - type: 'null'
+          title: Wait For
+      required:
+      - urls
+      title: BatchScrapeRequest
+      type: object
+    BatchScrapeResponse:
+      properties:
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Id
+        invalid_urls:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Invalid Urls
+        success:
+          default: true
+          title: Success
+          type: boolean
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Url
+      title: BatchScrapeResponse
+      type: object
+    CrawlRequest:
+      properties:
+        allow_backward_links:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Allow Backward Links
+        allow_external_links:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Allow External Links
+        deduplicate_similar_urls:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Deduplicate Similar Urls
+        delay:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 0
+          title: Delay
+        exclude_paths:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Exclude Paths
+        ignore_query_parameters:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Ignore Query Parameters
+        ignore_sitemap:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Ignore Sitemap
+        include_paths:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Include Paths
+        include_subdomains:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Include Subdomains
+        limit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 50
+          title: Limit
+        max_bytes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Max Bytes
+        max_concurrency:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 10
+          title: Max Concurrency
+        max_depth:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 2
+          title: Max Depth
+        max_time:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Max Time
+        scrape_options:
+          anyOf:
+          - $ref: '#/components/schemas/ScrapeOptions'
+          - type: 'null'
+        url:
+          title: Url
+          type: string
+        webhook:
+          anyOf:
+          - type: string
+          - $ref: '#/components/schemas/WebhookConfig'
+          - type: 'null'
+          title: Webhook
+      required:
+      - url
+      title: CrawlRequest
+      type: object
+    CrawlResponse:
+      properties:
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Id
+        success:
+          default: true
+          title: Success
+          type: boolean
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Url
+      title: CrawlResponse
+      type: object
+    CrawlStatusResponse:
+      properties:
+        completed:
+          default: 0
+          title: Completed
+          type: integer
+        credits_used:
+          default: 0
+          title: Credits Used
+          type: integer
+        data:
+          default: []
+          items:
+            $ref: '#/components/schemas/FirecrawlDocument'
+          title: Data
+          type: array
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        expires_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Expires At
+        next:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next
+        status:
+          default: scraping
+          enum:
+          - scraping
+          - completed
+          - failed
+          - cancelled
+          title: Status
+          type: string
+        success:
+          default: true
+          title: Success
+          type: boolean
+        total:
+          default: 0
+          title: Total
+          type: integer
+      title: CrawlStatusResponse
+      type: object
+    DocumentMetadata:
+      properties:
+        blocked:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Blocked
+        blocked_reason:
+          anyOf:
+          - enum:
+            - captcha
+            - ip_block
+            - robots_disallow
+            - rate_limited
+            type: string
+          - type: 'null'
+          title: Blocked Reason
+        content_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Type
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        file_metadata:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: File Metadata
+        language:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Language
+        source_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Url
+        status_code:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Status Code
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+      title: DocumentMetadata
+      type: object
+    FirecrawlDocument:
+      properties:
+        content_base64:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Base64
+        html:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Html
+        links:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Links
+        markdown:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Markdown
+        metadata:
+          anyOf:
+          - $ref: '#/components/schemas/DocumentMetadata'
+          - type: 'null'
+        raw_html:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Raw Html
+        screenshot:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Screenshot
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Url
+      title: FirecrawlDocument
+      type: object
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          title: Detail
+          type: array
+      title: HTTPValidationError
+      type: object
+    HealthResponse:
+      properties:
+        browserError:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Browsererror
+        browserReady:
+          default: true
+          title: Browserready
+          type: boolean
+        status:
+          default: healthy
+          title: Status
+          type: string
+        timestamp:
+          format: date-time
+          title: Timestamp
+          type: string
+        version:
+          default: 1.0.0
+          title: Version
+          type: string
+      title: HealthResponse
+      type: object
+    LocationConfig:
+      properties:
+        country:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Country
+        languages:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Languages
+      title: LocationConfig
+      type: object
+    MapRequest:
+      properties:
+        ignore_sitemap:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Ignore Sitemap
+        include_subdomains:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Include Subdomains
+        limit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: 5000
+          title: Limit
+        search:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Search
+        url:
+          title: Url
+          type: string
+      required:
+      - url
+      title: MapRequest
+      type: object
+    MapResponse:
+      properties:
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        links:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Links
+        success:
+          default: true
+          title: Success
+          type: boolean
+      title: MapResponse
+      type: object
+    ScrapeAction:
+      properties:
+        button:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Button
+        direction:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Direction
+        fullPage:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Fullpage
+        key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Key
+        milliseconds:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Milliseconds
+        script:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Script
+        selector:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Selector
+        targetSelector:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Targetselector
+        text:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Text
+        type:
+          title: Type
+          type: string
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Url
+        value:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Value
+      required:
+      - type
+      title: ScrapeAction
+      type: object
+    ScrapeOptions:
+      properties:
+        actions:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/ScrapeAction'
+            type: array
+          - type: 'null'
+          title: Actions
+        exclude_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Exclude Tags
+        formats:
+          anyOf:
+          - items:
+              enum:
+              - markdown
+              - html
+              - rawHtml
+              - content
+              - links
+              - screenshot
+              type: string
+            type: array
+          - type: 'null'
+          default:
+          - markdown
+          title: Formats
+        headers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Headers
+        include_file_body:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Include File Body
+        include_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Include Tags
+        location:
+          anyOf:
+          - $ref: '#/components/schemas/LocationConfig'
+          - type: 'null'
+        mobile:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Mobile
+        ocr:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Ocr
+        ocr_prompt:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ocr Prompt
+        ocr_provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ocr Provider
+        only_main_content:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Only Main Content
+        parse_pdf:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Parse Pdf
+        remove_base64_images:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Remove Base64 Images
+        skip_tls_verification:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Skip Tls Verification
+        timeout:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Timeout
+        use_relative_links:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Use Relative Links
+        wait_for:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Wait For
+      title: ScrapeOptions
+      type: object
+    ScrapeRequest:
+      properties:
+        exclude_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Exclude Tags
+        formats:
+          anyOf:
+          - items:
+              enum:
+              - markdown
+              - html
+              - rawHtml
+              - content
+              - links
+              - screenshot
+              type: string
+            type: array
+          - type: 'null'
+          default:
+          - markdown
+          title: Formats
+        headers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Headers
+        include_file_body:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Include File Body
+        include_tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Include Tags
+        location:
+          anyOf:
+          - $ref: '#/components/schemas/LocationConfig'
+          - type: 'null'
+        mobile:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Mobile
+        only_main_content:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: true
+          title: Only Main Content
+        remove_base64_images:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: true
+          title: Remove Base64 Images
+        skip_tls_verification:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Skip Tls Verification
+        timeout:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Timeout
+        url:
+          title: Url
+          type: string
+        use_relative_links:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: false
+          title: Use Relative Links
+        wait_for:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Wait For
+      required:
+      - url
+      title: ScrapeRequest
+      type: object
+    ScrapeResponse:
+      properties:
+        data:
+          anyOf:
+          - $ref: '#/components/schemas/FirecrawlDocument'
+          - type: 'null'
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        success:
+          default: true
+          title: Success
+          type: boolean
+        warning:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Warning
+      title: ScrapeResponse
+      type: object
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          title: Location
+          type: array
+        msg:
+          title: Message
+          type: string
+        type:
+          title: Error Type
+          type: string
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+      type: object
+    WebhookConfig:
+      properties:
+        headers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Headers
+        metadata:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Metadata
+        url:
+          title: Url
+          type: string
+      required:
+      - url
+      title: WebhookConfig
+      type: object
+info:
+  description: Self-hosted web scraping and crawling service
+  title: Firecrawl API
+  version: 1.0.0
+openapi: 3.1.0
+paths:
+  /health:
+    get:
+      description: Health check endpoint
+      operationId: health_check_health_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+          description: Successful Response
+      summary: Health Check
+  /metrics:
+    get:
+      description: Prometheus metrics endpoint.
+      operationId: metrics_metrics_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Metrics
+  /v1/batch-scrape:
+    post:
+      description: Start a batch scraping job
+      operationId: batch_scrape_v1_batch_scrape_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchScrapeRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchScrapeResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Batch Scrape
+  /v1/batch-scrape/{job_id}:
+    get:
+      description: Get batch scrape job status
+      operationId: get_batch_status_v1_batch_scrape__job_id__get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get Batch Status
+  /v1/crawl:
+    post:
+      description: Start a crawl job
+      operationId: crawl_url_v1_crawl_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrawlRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CrawlResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Crawl Url
+  /v1/crawl/{job_id}:
+    get:
+      description: Get crawl job status
+      operationId: get_crawl_status_v1_crawl__job_id__get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CrawlStatusResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get Crawl Status
+  /v1/crawl/{job_id}/cancel:
+    post:
+      description: Cancel a running crawl job
+      operationId: cancel_crawl_v1_crawl__job_id__cancel_post
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Cancel Crawl
+  /v1/crawl/{job_id}/export:
+    get:
+      description: Export crawl results (simple JSONL stream).
+      operationId: export_crawl_v1_crawl__job_id__export_get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      - in: query
+        name: format
+        required: false
+        schema:
+          default: jsonl
+          title: Format
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Export Crawl
+  /v1/map:
+    post:
+      description: Map a website to get all its links
+      operationId: map_url_v1_map_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MapRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MapResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Map Url
+  /v1/scrape:
+    post:
+      description: Scrape a single URL
+      operationId: scrape_url_v1_scrape_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScrapeRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScrapeResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Scrape Url
+  /v1/scrape/bulk:
+    post:
+      description: Scrape a list of URLs in bulk
+      operationId: bulk_scrape_v1_scrape_bulk_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchScrapeRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/ScrapeResponse'
+                title: Response Bulk Scrape V1 Scrape Bulk Post
+                type: array
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Bulk Scrape
+  /v1/scrape/{url}:
+    get:
+      description: Scrape a single URL via GET request
+      operationId: scrape_url_get_v1_scrape__url__get
+      parameters:
+      - in: path
+        name: url
+        required: true
+        schema:
+          title: Url
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScrapeResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Scrape Url Get
+  /v2/actions/capabilities:
+    get:
+      operationId: v2_actions_capabilities_v2_actions_capabilities_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionsCapabilitiesResponse'
+          description: Successful Response
+      summary: V2 Actions Capabilities
+  /v2/batch/scrape:
+    post:
+      operationId: v2_batch_scrape_v2_batch_scrape_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Batch Scrape
+  /v2/batch/scrape/{job_id}:
+    delete:
+      operationId: v2_cancel_batch_v2_batch_scrape__job_id__delete
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Cancel Batch
+    get:
+      operationId: v2_get_batch_status_v2_batch_scrape__job_id__get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Get Batch Status
+  /v2/batch/scrape/{job_id}/errors:
+    get:
+      operationId: v2_batch_errors_v2_batch_scrape__job_id__errors_get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Batch Errors
+  /v2/crawl:
+    post:
+      operationId: v2_crawl_v2_crawl_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Crawl
+  /v2/crawl/{job_id}:
+    delete:
+      operationId: v2_cancel_crawl_v2_crawl__job_id__delete
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Cancel Crawl
+    get:
+      operationId: v2_get_crawl_status_v2_crawl__job_id__get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Get Crawl Status
+  /v2/crawl/{job_id}/errors:
+    get:
+      operationId: v2_crawl_errors_v2_crawl__job_id__errors_get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Crawl Errors
+  /v2/extract:
+    post:
+      operationId: v2_extract_v2_extract_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Extract
+  /v2/extract/{job_id}:
+    get:
+      operationId: v2_extract_status_v2_extract__job_id__get
+      parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Extract Status
+  /v2/map:
+    post:
+      operationId: v2_map_v2_map_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Map
+  /v2/scrape:
+    post:
+      operationId: v2_scrape_v2_scrape_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Scrape
+  /v2/search:
+    post:
+      operationId: v2_search_v2_search_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: V2 Search

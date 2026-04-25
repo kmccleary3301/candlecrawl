@@ -11,7 +11,7 @@ from app.providers.base import ProviderError
 
 class ORMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[Any] = None
 
 
 class ORChoice(BaseModel):
@@ -83,6 +83,29 @@ class OpenRouterClient:
                 raise ProviderError("OpenRouter error", status_code=resp.status_code, payload=resp.text)
             data = resp.json()
             response = OpenRouterChatResponse.model_validate(data)
+            raw_choices = data.get("choices") if isinstance(data, dict) else None
+            if isinstance(raw_choices, list):
+                for idx, choice in enumerate(response.choices):
+                    if not isinstance(getattr(choice, "message", None), ORMessage):
+                        continue
+                    if choice.message.content:
+                        continue
+                    raw_choice = raw_choices[idx] if idx < len(raw_choices) and isinstance(raw_choices[idx], dict) else None
+                    raw_message = raw_choice.get("message") if isinstance(raw_choice, dict) else None
+                    if not isinstance(raw_message, dict):
+                        continue
+                    details = raw_message.get("reasoning_details")
+                    if not isinstance(details, list):
+                        continue
+                    summaries: list[str] = []
+                    for detail in details:
+                        if not isinstance(detail, dict):
+                            continue
+                        summary = detail.get("summary")
+                        if isinstance(summary, str) and summary.strip():
+                            summaries.append(summary.strip())
+                    if summaries:
+                        choice.message.content = "\n".join(summaries)
             
             # Extract actual cost from usage data
             actual_cost = None
@@ -93,5 +116,3 @@ class OpenRouterClient:
         finally:
             if created_client:
                 await created_client.aclose()
-
-

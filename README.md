@@ -102,6 +102,34 @@ python -m playwright install chromium
 python -m uvicorn app.main:app --host 0.0.0.0 --port 3010
 ```
 
+### Package-Oriented Development
+
+CandleCrawl also exposes a lightweight installable package surface for SDK,
+CLI, and Hermes integration work:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e ".[service,browser,pdf,ocr,test]"
+
+candlecrawl version
+candlecrawl doctor
+candlecrawl serve --host 0.0.0.0 --port 3010
+```
+
+For base SDK-only usage, install without service extras:
+
+```bash
+pip install -e .
+python -c "import candlecrawl, candlecrawl.client; print(candlecrawl.__version__)"
+```
+
+The package CLI is the preferred integration direction for downstream systems.
+Direct `uvicorn app.main:app` remains available as a legacy development path
+while the server internals are being moved behind the public `candlecrawl`
+package boundary.
+
 Health check:
 
 ```bash

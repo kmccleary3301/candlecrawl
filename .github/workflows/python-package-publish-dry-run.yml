@@ -1,0 +1,51 @@
+name: CandleCrawl Python Package Publish Dry Run
+
+on:
+  workflow_dispatch:
+
+jobs:
+  testpypi-dry-run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: testpypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and validate release artifacts
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          python -m build
+          python -m twine check dist/*
+          python scripts/check_package_boundaries.py
+
+      - name: Publish to TestPyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          verbose: true
+
+      - name: Verify install from TestPyPI
+        run: |
+          VERSION="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])
+          PY
+          )"
+          python -m venv /tmp/candlecrawl-testpypi
+          /tmp/candlecrawl-testpypi/bin/python -m pip install --upgrade pip
+          /tmp/candlecrawl-testpypi/bin/python -m pip install \
+            --index-url https://test.pypi.org/simple/ \
+            --extra-index-url https://pypi.org/simple/ \
+            "candlecrawl[service]==${VERSION}"
+          /tmp/candlecrawl-testpypi/bin/candlecrawl version
+          /tmp/candlecrawl-testpypi/bin/candlecrawl export-openapi --strict-v2 --output /tmp/candlecrawl-testpypi-openapi.yaml
+          test -s /tmp/candlecrawl-testpypi-openapi.yaml

@@ -22,3 +22,28 @@ async def test_resilient_http_client_retries_on_429():
         assert resp.status_code == 200
 
 
+@pytest.mark.asyncio
+async def test_resilient_http_client_passes_verify_flag():
+    created_kwargs = []
+
+    class DummyAsyncClient:
+        def __init__(self, *args, **kwargs):
+            created_kwargs.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            return httpx.Response(200, request=httpx.Request("GET", url))
+
+    with patch("app.http_client.httpx.AsyncClient", DummyAsyncClient):
+        client = ResilientHttpClient(timeout=2, verify=False)
+        resp = await client.get("https://x")
+        assert resp.status_code == 200
+
+    assert created_kwargs, "Expected AsyncClient to be instantiated"
+    assert created_kwargs[-1]["verify"] is False
+

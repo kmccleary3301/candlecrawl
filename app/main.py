@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Response
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -16,7 +17,10 @@ from urllib.robotparser import RobotFileParser
 import xml.etree.ElementTree as ET
 import httpx
 import hashlib
+import hmac
 import json
+import ipaddress
+import socket
 import time
 from loguru import logger
 
@@ -26,19 +30,22 @@ from app.models import (
     CrawlRequest, CrawlResponse, CrawlStatusResponse,
     BatchScrapeRequest, BatchScrapeResponse,
     MapRequest, MapResponse,
+    ActionCapability, ActionFieldCapability, ActionsCapabilitiesResponse,
     FirecrawlDocument, DocumentMetadata, ScrapeOptions,
-    HermesSearchRequest, HermesSearchResponse,
-    HermesComposeRequest, HermesComposeResponse,
-    HermesExternalScrapeRequest, HermesExternalScrapeResponse,
-    HermesEnrichRequest, HermesEnrichResponse,
     utc_now,
 )
 from app.scraper import scraper
 from app.frontier import MemoryFrontier
 from app.providers.serper import SerperClient, SerperImageRequest, SerperNewsRequest, SerperSearchRequest
-from app.providers.openrouter import OpenRouterClient, OpenRouterChatRequest, ORMessage
-from app.providers.scrapedo import ScrapeDoClient, ScrapeDoRequest
-from app.cost_endpoints import router as cost_router
+from app.metrics import (
+    metrics_response,
+    record_budget_guardrail,
+    record_kill_switch,
+    record_security_deny,
+)
+from app.compat.firecrawl_v2 import apply_v2_contract_headers, json_error
+from app.artifacts import ArtifactSinkSelectorConfig, select_artifact_sink
+from app.querylake_files_sink import QueryLakeFilesArtifactSink, QueryLakeFilesSinkConfig
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -73,14 +80,479 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _v2_configured_api_keys() -> set[str]:
+    raw = getattr(settings, "v2_api_keys", "") or ""
+    return {k.strip() for k in raw.split(",") if k.strip()}
+
+
+def _extract_v2_auth_token(request: Request) -> str | None:
+    auth_header = request.headers.get("authorization", "")
+    if isinstance(auth_header, str) and auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            return token
+    api_key = request.headers.get("x-api-key")
+    if isinstance(api_key, str) and api_key.strip():
+        return api_key.strip()
+    return None
+
+
+def _resolve_request_tenant_id(request: Request, auth_token: str | None = None) -> str:
+    tenant_header = request.headers.get("x-tenant-id")
+    if isinstance(tenant_header, str) and tenant_header.strip():
+        return tenant_header.strip()
+    if auth_token:
+        return f"token-{hashlib.sha256(auth_token.encode('utf-8')).hexdigest()[:12]}"
+    return settings.v2_default_tenant_id
+
+
+def _enforce_v2_auth(request: Request) -> Response | None:
+    if not settings.v2_auth_enabled:
+        request.state.tenant_id = _resolve_request_tenant_id(request)
+        return None
+
+    configured_keys = _v2_configured_api_keys()
+    if not configured_keys:
+        record_security_deny("v2_auth", "misconfigured")
+        return json_error(
+            "Authentication is enabled but no API keys are configured",
+            status_code=500,
+            code="AUTH_MISCONFIGURED",
+        )
+
+    token = _extract_v2_auth_token(request)
+    if not token or token not in configured_keys:
+        record_security_deny("v2_auth", "unauthorized")
+        return json_error("Unauthorized", status_code=401, code="UNAUTHORIZED")
+
+    request.state.tenant_id = _resolve_request_tenant_id(request, token)
+    return None
+
+
+def _request_tenant_id(request: Request) -> str:
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if isinstance(tenant_id, str) and tenant_id.strip():
+        return tenant_id.strip()
+    return settings.v2_default_tenant_id
+
+
+def _enforce_job_tenant(request: Request, job_data: Dict[str, Any]) -> Response | None:
+    job_tenant = (job_data or {}).get("tenant_id") or settings.v2_default_tenant_id
+    if job_tenant != _request_tenant_id(request):
+        record_security_deny("v2_jobs", "tenant_forbidden")
+        return json_error("Forbidden", status_code=403, code="TENANT_FORBIDDEN")
+    return None
+
+
+def _ip_is_private_or_local(ip_value: ipaddress._BaseAddress) -> bool:
+    return any(
+        [
+            ip_value.is_private,
+            ip_value.is_loopback,
+            ip_value.is_link_local,
+            ip_value.is_reserved,
+            ip_value.is_multicast,
+            ip_value.is_unspecified,
+        ]
+    )
+
+
+def _host_resolves_to_private_network(host: str) -> bool:
+    normalized = (host or "").strip().lower()
+    if not normalized:
+        return True
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        literal_ip = ipaddress.ip_address(normalized)
+        return _ip_is_private_or_local(literal_ip)
+    except ValueError:
+        pass
+
+    try:
+        addrinfos = socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+    except Exception:
+        # If DNS resolution fails, leave validation to downstream URL handling.
+        return False
+
+    for addrinfo in addrinfos:
+        try:
+            resolved_ip = ipaddress.ip_address(addrinfo[4][0])
+        except Exception:
+            continue
+        if _ip_is_private_or_local(resolved_ip):
+            return True
+    return False
+
+
+def _is_ssrf_blocked_url(url: str) -> bool:
+    if not settings.v2_ssrf_protection_enabled:
+        return False
+    if settings.v2_allow_private_network:
+        return False
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return True
+    if (host == "localhost" or host.endswith(".localhost")) and settings.v2_allow_localhost:
+        return False
+    return _host_resolves_to_private_network(host)
+
+
+def _v2_status_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
+    if settings.strict_firecrawl_v2:
+        return fields
+    return {"success": True, **fields}
+
+
+def _v2_errors_payload(errors: List[Dict[str, Any]] | List[str], robots_blocked: List[str]) -> Dict[str, Any]:
+    payload = {"errors": errors, "robotsBlocked": robots_blocked}
+    if settings.strict_firecrawl_v2:
+        return payload
+    return {"success": True, "data": payload}
+
+
+def _make_job_error_item(url: str, error: str) -> Dict[str, Any]:
+    return {
+        "id": str(uuid.uuid4()),
+        "timestamp": utc_now().isoformat(),
+        "url": url,
+        "error": error,
+    }
+
+
+def _v2_cancel_payload(message: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"success": True, "message": message}
+    if not settings.strict_firecrawl_v2:
+        payload["status"] = "cancelled"
+    return payload
+
+
+def _parse_status_cursor(cursor_raw: str | None) -> int | None:
+    if cursor_raw is None:
+        return 0
+    cursor = cursor_raw.strip()
+    if not cursor:
+        return 0
+    if cursor.lower().startswith("offset:"):
+        cursor = cursor.split(":", 1)[1].strip()
+    try:
+        value = int(cursor)
+    except Exception:
+        return None
+    return value if value >= 0 else None
+
+
+def _normalize_webhook_config(raw_webhook: Any) -> Dict[str, Any] | None:
+    if isinstance(raw_webhook, str):
+        url = raw_webhook.strip()
+        if not url:
+            return None
+        return {"url": url, "headers": {}, "metadata": {}}
+    if not isinstance(raw_webhook, dict):
+        return None
+    url = raw_webhook.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+
+    normalized_headers: Dict[str, str] = {}
+    headers = raw_webhook.get("headers")
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if isinstance(key, str) and key.strip() and isinstance(value, str):
+                normalized_headers[key.strip()] = value
+
+    normalized_metadata: Dict[str, str] = {}
+    metadata = raw_webhook.get("metadata")
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            if isinstance(key, str) and key.strip() and isinstance(value, str):
+                normalized_metadata[key.strip()] = value
+
+    return {
+        "url": url.strip(),
+        "headers": normalized_headers,
+        "metadata": normalized_metadata,
+    }
+
+
+def _webhook_event_name(job_type: str, status: str) -> str:
+    event_status = (status or "unknown").strip().lower() or "unknown"
+    return f"{job_type}.{event_status}"
+
+
+def _webhook_signature(secret: str, body: bytes) -> str:
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+async def _deliver_job_webhook(
+    *,
+    job_type: str,
+    job_id: str,
+    job_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    request_payload = job_data.get("request") if isinstance(job_data, dict) else None
+    webhook_cfg = _normalize_webhook_config((request_payload or {}).get("webhook") if isinstance(request_payload, dict) else None)
+    if not webhook_cfg:
+        return {
+            "status": "skipped",
+            "reason": "not_configured",
+            "attempts": 0,
+            "event": _webhook_event_name(job_type, str(job_data.get("status") or "")),
+        }
+
+    status_value = str(job_data.get("status") or "unknown")
+    event_name = _webhook_event_name(job_type, status_value)
+    payload = {
+        "event": event_name,
+        "job": {
+            "id": job_id,
+            "type": job_type,
+            "status": status_value,
+            "completed": job_data.get("completed"),
+            "total": job_data.get("total"),
+            "creditsUsed": job_data.get("credits_used"),
+            "expiresAt": job_data.get("expires_at").isoformat()
+            if isinstance(job_data.get("expires_at"), datetime)
+            else job_data.get("expires_at"),
+            "error": job_data.get("error"),
+            "next": job_data.get("next"),
+        },
+        "errorsCount": len(job_data.get("errors") or []) if isinstance(job_data.get("errors"), list) else 0,
+        "robotsBlockedCount": len(job_data.get("robots_blocked") or [])
+        if isinstance(job_data.get("robots_blocked"), list)
+        else 0,
+        "metadata": webhook_cfg.get("metadata") or {},
+        "timestamp": utc_now().isoformat(),
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    ts_epoch_ms = str(int(time.time() * 1000))
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "candlecrawl-webhook/1.0",
+        "X-CandleCrawl-Event": event_name,
+        "X-CandleCrawl-Job-Id": job_id,
+        "X-CandleCrawl-Timestamp": ts_epoch_ms,
+    }
+    for key, value in (webhook_cfg.get("headers") or {}).items():
+        if isinstance(key, str) and key and isinstance(value, str):
+            headers[key] = value
+    if settings.webhook_signing_secret:
+        headers["X-CandleCrawl-Signature"] = _webhook_signature(settings.webhook_signing_secret, body)
+
+    max_retries = max(0, int(settings.webhook_max_retries))
+    timeout_seconds = float(settings.webhook_timeout_seconds)
+    base_delay_ms = max(10, int(settings.webhook_retry_base_delay_ms))
+
+    attempts = 0
+    last_error: str | None = None
+    last_status_code: int | None = None
+    delivery_ok = False
+
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        for attempt in range(max_retries + 1):
+            attempts = attempt + 1
+            try:
+                response = await client.post(webhook_cfg["url"], content=body, headers=headers)
+                last_status_code = int(response.status_code)
+                if 200 <= response.status_code < 300:
+                    delivery_ok = True
+                    break
+
+                # Retry transient failures only.
+                if response.status_code in {408, 409, 425, 429} or response.status_code >= 500:
+                    if attempt < max_retries:
+                        await asyncio.sleep((base_delay_ms * (2 ** attempt)) / 1000.0)
+                        continue
+                text = response.text if isinstance(response.text, str) else ""
+                last_error = f"webhook_http_{response.status_code}:{text[:300]}"
+                break
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    await asyncio.sleep((base_delay_ms * (2 ** attempt)) / 1000.0)
+                    continue
+                break
+
+    return {
+        "status": "delivered" if delivery_ok else "failed",
+        "attempts": attempts,
+        "event": event_name,
+        "url": webhook_cfg["url"],
+        "last_status_code": last_status_code,
+        "last_error": last_error,
+        "delivered_at": utc_now().isoformat() if delivery_ok else None,
+    }
+
+
+def _artifact_mode_from_payload(payload: Dict[str, Any]) -> str | None:
+    mode = payload.get("artifact_mode")
+    if mode is None:
+        mode = payload.get("artifactMode")
+    return mode if isinstance(mode, str) else None
+
+
+def _trace_headers_for_upstream(request: Request) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    request_id = getattr(request.state, "request_id", None)
+    audit_id = getattr(request.state, "audit_id", None)
+    trace_id = getattr(request.state, "trace_id", None)
+    if isinstance(request_id, str) and request_id.strip():
+        headers["X-Request-Id"] = request_id.strip()
+    if isinstance(audit_id, str) and audit_id.strip():
+        headers["X-Audit-Id"] = audit_id.strip()
+    if isinstance(trace_id, str) and trace_id.strip():
+        headers["X-Trace-Id"] = trace_id.strip()
+    tenant_id = _request_tenant_id(request)
+    if tenant_id:
+        headers["X-Tenant-Id"] = tenant_id
+    idem_key = _get_idempotency_key(request)
+    if idem_key:
+        headers["X-Idempotency-Key"] = idem_key
+    return headers
+
+
+def _artifact_selector_config_for_request(request: Request) -> ArtifactSinkSelectorConfig:
+    querylake_sink = None
+    if settings.artifact_querylake_enabled and settings.querylake_files_base_url:
+        querylake_sink = QueryLakeFilesArtifactSink(
+            config=QueryLakeFilesSinkConfig(
+                base_url=settings.querylake_files_base_url,
+                ingestion_path=settings.querylake_files_ingestion_path,
+                auth_header=settings.querylake_files_auth_header,
+                auth_token=settings.querylake_files_auth_token,
+                timeout_seconds=settings.querylake_files_timeout_seconds,
+                max_retries=settings.querylake_files_max_retries,
+                retry_base_delay_ms=settings.querylake_files_retry_base_delay_ms,
+                tenant_id=_request_tenant_id(request),
+                collection_id=settings.querylake_files_collection_id,
+                source="candlecrawl_v2_scrape",
+            )
+        )
+    return ArtifactSinkSelectorConfig(
+        default_mode=settings.artifact_mode_default,
+        allow_fallback_to_inline=settings.artifact_allow_fallback_to_inline,
+        local_root=settings.artifact_local_root,
+        inline_max_bytes=settings.artifact_inline_max_bytes,
+        querylake_enabled=settings.artifact_querylake_enabled,
+        querylake_sink=querylake_sink,
+    )
+
+
+async def _maybe_externalize_v2_artifacts(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    data: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    requested_mode = _artifact_mode_from_payload(payload)
+    selection = select_artifact_sink(requested_mode, config=_artifact_selector_config_for_request(request))
+    artifacts: Dict[str, Any] = {}
+    transformed = dict(data)
+    externalized_fields = {
+        "markdown": ("artifact_markdown.md", "text/markdown"),
+        "html": ("artifact_html.html", "text/html"),
+        "rawHtml": ("artifact_raw_html.html", "text/html"),
+    }
+
+    try:
+        if selection.resolved_mode != "inline":
+            for field_name, (filename, content_type) in externalized_fields.items():
+                value = transformed.get(field_name)
+                if not isinstance(value, str) or not value:
+                    continue
+                ref = await selection.sink.put_bytes(
+                    content=value.encode("utf-8"),
+                    filename=filename,
+                    content_type=content_type,
+                    trace_headers=_trace_headers_for_upstream(request),
+                )
+                artifacts[field_name] = asdict(ref)
+                transformed.pop(field_name, None)
+    finally:
+        close_fn = getattr(selection.sink, "aclose", None)
+        if callable(close_fn):
+            await close_fn()
+
+    metadata = {
+        "artifactMode": selection.resolved_mode,
+        "artifactFallback": selection.fallback_reason,
+        "artifacts": artifacts or None,
+    }
+    return transformed, metadata
+
+
+@app.middleware("http")
+async def attach_v2_contract_headers(request: Request, call_next):
+    """Stamp trace/contract headers and enforce v2 auth."""
+    request_id = request.headers.get("x-request-id") or request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    audit_id = request.headers.get("x-audit-id") or request.headers.get("X-Audit-Id") or request_id
+    trace_id = request.headers.get("x-trace-id") or request.headers.get("X-Trace-Id") or request_id or audit_id
+    request.state.request_id = request_id
+    request.state.audit_id = audit_id
+    request.state.trace_id = trace_id
+    inbound_idempotency = _get_idempotency_key(request)
+
+    if request.url.path.startswith("/v2/"):
+        auth_error = _enforce_v2_auth(request)
+        if auth_error is not None:
+            auth_error.headers["X-Request-Id"] = request_id
+            auth_error.headers["X-Audit-Id"] = audit_id
+            auth_error.headers["X-Trace-Id"] = trace_id
+            if inbound_idempotency:
+                auth_error.headers["X-Idempotency-Key"] = inbound_idempotency
+            tenant_id = _request_tenant_id(request)
+            if tenant_id:
+                auth_error.headers["X-Tenant-Id"] = tenant_id
+            apply_v2_contract_headers(auth_error)
+            return auth_error
+    response = await call_next(request)
+
+    response.headers["X-Request-Id"] = request_id
+    response.headers["X-Audit-Id"] = audit_id
+    response.headers["X-Trace-Id"] = trace_id
+    if inbound_idempotency:
+        response.headers["X-Idempotency-Key"] = inbound_idempotency
+    tenant_id = _request_tenant_id(request)
+    if tenant_id:
+        response.headers["X-Tenant-Id"] = tenant_id
+
+    if request.url.path.startswith("/v2/"):
+        apply_v2_contract_headers(response)
+    return response
+
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)
 
-# Include cost tracking router
-app.include_router(cost_router)
+
+def _rate_limit_spec(requests: int, window_seconds: int) -> str:
+    req = max(1, int(requests))
+    window = max(1, int(window_seconds))
+    return f"{req}/{window}seconds"
+
+
+def _rate_limit_exceeded_handler_with_metrics(request: Request, exc: RateLimitExceeded):
+    record_security_deny(request.url.path, "rate_limit_exceeded")
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+V2_LIMIT_SCRAPE = _rate_limit_spec(settings.v2_rate_limit_scrape_requests, settings.v2_rate_limit_window_seconds)
+V2_LIMIT_MAP = _rate_limit_spec(settings.v2_rate_limit_map_requests, settings.v2_rate_limit_window_seconds)
+V2_LIMIT_SEARCH = _rate_limit_spec(settings.v2_rate_limit_search_requests, settings.v2_rate_limit_window_seconds)
+V2_LIMIT_CRAWL = _rate_limit_spec(settings.v2_rate_limit_crawl_requests, settings.v2_rate_limit_window_seconds)
+V2_LIMIT_BATCH_SCRAPE = _rate_limit_spec(
+    settings.v2_rate_limit_batch_scrape_requests,
+    settings.v2_rate_limit_window_seconds,
+)
+V2_LIMIT_EXTRACT = _rate_limit_spec(settings.v2_rate_limit_extract_requests, settings.v2_rate_limit_window_seconds)
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler_with_metrics)
+app.add_middleware(SlowAPIMiddleware)
 
 # Redis connection for job queue
 try:
@@ -142,22 +614,147 @@ def _ms_to_seconds(value: Any) -> int | None:
     return max(1, int((ms + 999) // 1000))
 
 
+def _normalize_v2_format_token(token: str) -> str | None:
+    normalized = token.strip().lower()
+    mapping = {
+        "markdown": "markdown",
+        "md": "markdown",
+        "content": "markdown",
+        "html": "html",
+        "rawhtml": "rawHtml",
+        "raw_html": "rawHtml",
+        "raw-html": "rawHtml",
+        "links": "links",
+        "link": "links",
+        "screenshot": "screenshot",
+        "screenshot@fullpage": "screenshot",
+        "screenshot@full_page": "screenshot",
+    }
+    return mapping.get(normalized)
+
+
+def _requested_v2_format_types(payload: Dict[str, Any]) -> set[str]:
+    formats_in = payload.get("formats")
+    requested: set[str] = set()
+    if not isinstance(formats_in, list):
+        return requested
+
+    def _norm_type(raw: str) -> str:
+        t = raw.strip().lower()
+        aliases = {
+            "raw_html": "rawhtml",
+            "raw-html": "rawhtml",
+            "changetracking": "changetracking",
+            "change-tracking": "changetracking",
+        }
+        return aliases.get(t, t)
+
+    for item in formats_in:
+        if isinstance(item, str):
+            requested.add(_norm_type(item))
+            continue
+        if isinstance(item, dict) and isinstance(item.get("type"), str):
+            requested.add(_norm_type(item["type"]))
+    return requested
+
+
+def _parse_pdf_requested(payload: Dict[str, Any]) -> bool:
+    if _coerce_bool(payload.get("parsePDF"), False) or _coerce_bool(payload.get("parsePdf"), False):
+        return True
+    parsers_in = payload.get("parsers")
+    if not isinstance(parsers_in, list):
+        return False
+
+    for item in parsers_in:
+        if isinstance(item, str):
+            normalized = item.strip().lower()
+            if normalized in {"pdf", "application/pdf"}:
+                return True
+        elif isinstance(item, dict):
+            parser_type = item.get("type")
+            if isinstance(parser_type, str) and parser_type.strip().lower() in {"pdf", "application/pdf"}:
+                return True
+    return False
+
+
+def _parse_ocr_config(payload: Dict[str, Any]) -> tuple[bool, str | None, str | None]:
+    enabled = False
+    provider: str | None = None
+    prompt: str | None = None
+
+    ocr_payload = payload.get("ocr")
+    if isinstance(ocr_payload, bool):
+        enabled = ocr_payload
+    elif isinstance(ocr_payload, dict):
+        enabled = _coerce_bool(ocr_payload.get("enabled"), True)
+        provider_raw = ocr_payload.get("provider")
+        if isinstance(provider_raw, str) and provider_raw.strip():
+            provider = provider_raw.strip()
+        prompt_raw = ocr_payload.get("prompt")
+        if isinstance(prompt_raw, str) and prompt_raw.strip():
+            prompt = prompt_raw.strip()
+
+    provider_raw = payload.get("ocrProvider")
+    if isinstance(provider_raw, str) and provider_raw.strip():
+        provider = provider_raw.strip()
+        enabled = True
+
+    prompt_raw = payload.get("ocrPrompt")
+    if isinstance(prompt_raw, str) and prompt_raw.strip():
+        prompt = prompt_raw.strip()
+
+    parsers_in = payload.get("parsers")
+    if isinstance(parsers_in, list):
+        for item in parsers_in:
+            parser_token: str | None = None
+            if isinstance(item, str):
+                parser_token = item.strip().lower()
+            elif isinstance(item, dict) and isinstance(item.get("type"), str):
+                parser_token = item.get("type", "").strip().lower()
+            if not parser_token:
+                continue
+            if parser_token in {"ocr", "vision"}:
+                enabled = True
+            elif parser_token in {"mistral", "mistral_ocr", "mistral-ocr"}:
+                enabled = True
+                provider = "mistral"
+            elif parser_token in {"querylake", "chandra", "querylake_chandra", "querylake-chandra"}:
+                enabled = True
+                provider = "querylake_chandra"
+
+    return enabled, provider, prompt
+
+
 def _scrape_options_from_v2(payload: Dict[str, Any]) -> ScrapeOptions:
     formats_in = payload.get("formats")
+    requested_types = _requested_v2_format_types(payload)
     formats: list[str] = []
+    seen_formats: set[str] = set()
     if isinstance(formats_in, list):
         for item in formats_in:
             if isinstance(item, str):
-                if item in {"markdown", "html", "rawHtml", "links", "screenshot"}:
-                    formats.append(item)
-                elif item == "screenshot@fullPage":
-                    formats.append("screenshot")
+                normalized = _normalize_v2_format_token(item)
+                if normalized and normalized not in seen_formats:
+                    formats.append(normalized)
+                    seen_formats.add(normalized)
             elif isinstance(item, dict):
-                if item.get("type") == "screenshot":
-                    formats.append("screenshot")
-                # json/extract/branding/changeTracking/summary are ignored (not supported by this server)
+                item_type = item.get("type")
+                if isinstance(item_type, str):
+                    normalized = _normalize_v2_format_token(item_type)
+                    if normalized and normalized not in seen_formats:
+                        formats.append(normalized)
+                        seen_formats.add(normalized)
+                # Non-render output variants (json/summary/etc.) are derived later.
     if not formats:
         formats = ["markdown"]
+    elif (
+        requested_types.intersection({"json", "summary", "branding", "changetracking"})
+        and "markdown" not in seen_formats
+    ):
+        # Ensure we have source text available to derive richer output formats.
+        formats.append("markdown")
+
+    ocr_enabled, ocr_provider, ocr_prompt = _parse_ocr_config(payload)
 
     return ScrapeOptions(
         formats=formats,
@@ -173,8 +770,94 @@ def _scrape_options_from_v2(payload: Dict[str, Any]) -> ScrapeOptions:
         remove_base64_images=payload.get("removeBase64Images"),
         use_relative_links=payload.get("useRelativeLinks"),
         include_file_body=payload.get("includeFileBody"),
+        parse_pdf=_parse_pdf_requested(payload),
+        ocr=ocr_enabled,
+        ocr_provider=ocr_provider,
+        ocr_prompt=ocr_prompt,
         actions=payload.get("actions") if isinstance(payload.get("actions"), list) else None,
     )
+
+
+def _derive_summary_text(data: Dict[str, Any]) -> str | None:
+    source = data.get("markdown") or data.get("html")
+    if not isinstance(source, str):
+        return None
+    text = " ".join(source.strip().split())
+    if not text:
+        return None
+    # Deterministic lightweight summary: first ~320 characters.
+    return text[:320]
+
+
+def _augment_v2_data_with_format_objects(
+    data: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> tuple[Dict[str, Any], list[str]]:
+    requested_types = _requested_v2_format_types(payload)
+    if not requested_types:
+        return data, []
+
+    out = dict(data)
+    warnings: list[str] = []
+
+    if "summary" in requested_types and out.get("summary") is None:
+        summary = _derive_summary_text(out)
+        if summary is not None:
+            out["summary"] = summary
+
+    if "json" in requested_types and out.get("json") is None:
+        source_text = out.get("markdown") or out.get("html")
+        if isinstance(source_text, str):
+            out["json"] = {
+                "content": source_text,
+                "metadata": out.get("metadata") if isinstance(out.get("metadata"), dict) else {},
+            }
+
+    if "branding" in requested_types and out.get("branding") is None:
+        source_html = out.get("html") or out.get("rawHtml") or ""
+        colors: list[str] = []
+        fonts: list[str] = []
+        if isinstance(source_html, str) and source_html:
+            colors = list(dict.fromkeys(re.findall(r"#[0-9a-fA-F]{3,8}", source_html)))[:10]
+            fonts = list(
+                dict.fromkeys(
+                    [m.strip().strip("'\"") for m in re.findall(r"font-family\\s*:\\s*([^;]+);", source_html, flags=re.IGNORECASE)]
+                )
+            )[:10]
+        out["branding"] = {"colors": colors, "fonts": fonts}
+
+    if "changetracking" in requested_types and out.get("changeTracking") is None:
+        source_text = out.get("markdown") or out.get("html") or ""
+        snapshot_hash = (
+            hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+            if isinstance(source_text, str) and source_text
+            else None
+        )
+        out["changeTracking"] = {
+            "snapshotHash": snapshot_hash,
+            "capturedAt": utc_now().isoformat(),
+            "mode": "snapshot",
+        }
+
+    known_types = {
+        "markdown",
+        "md",
+        "content",
+        "html",
+        "rawhtml",
+        "links",
+        "link",
+        "screenshot",
+        "json",
+        "summary",
+        "branding",
+        "changetracking",
+    }
+    unknown = sorted(requested_types.difference(known_types))
+    if unknown:
+        warnings.append("Unknown format types ignored: " + ", ".join(unknown))
+
+    return out, warnings
 
 
 def _v2_document_from_v1(doc: FirecrawlDocument | Dict[str, Any]) -> Dict[str, Any]:
@@ -215,6 +898,10 @@ def _v2_document_from_v1(doc: FirecrawlDocument | Dict[str, Any]) -> Dict[str, A
         out["links"] = data.get("links")
     if data.get("screenshot") is not None:
         out["screenshot"] = data.get("screenshot")
+    if data.get("content_base64") is not None:
+        out["contentBase64"] = data.get("content_base64")
+    if data.get("contentBase64") is not None:
+        out["contentBase64"] = data.get("contentBase64")
     if meta_out:
         out["metadata"] = meta_out
     else:
@@ -223,6 +910,34 @@ def _v2_document_from_v1(doc: FirecrawlDocument | Dict[str, Any]) -> Dict[str, A
             out["metadata"] = meta_in
 
     return out
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _estimate_document_credits(doc: FirecrawlDocument | Dict[str, Any]) -> int:
+    data = doc.model_dump() if hasattr(doc, "model_dump") else (doc or {})
+    if not isinstance(data, dict):
+        return 1
+
+    meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    content_type = meta.get("content_type") or meta.get("contentType")
+    if isinstance(content_type, str) and content_type.lower().startswith("application/pdf"):
+        file_meta = meta.get("file_metadata") or meta.get("fileMetadata")
+        if isinstance(file_meta, dict):
+            page_count = _coerce_positive_int(file_meta.get("page_count") or file_meta.get("pageCount"))
+            if page_count is not None:
+                return max(1, page_count)
+    return 1
+
+
+def _estimate_documents_credits(documents: List[FirecrawlDocument | Dict[str, Any]]) -> int:
+    return sum(_estimate_document_credits(doc) for doc in documents)
 
 
 def _canonicalize_url(
@@ -312,11 +1027,14 @@ def _scrape_cache_key(url: str, payload: Dict[str, Any]) -> str:
             "removeBase64Images": payload.get("removeBase64Images"),
             "useRelativeLinks": payload.get("useRelativeLinks"),
             "includeFileBody": payload.get("includeFileBody"),
+            "parsePDF": payload.get("parsePDF"),
+            "parsePdf": payload.get("parsePdf"),
             "actions": payload.get("actions"),
             "parsers": payload.get("parsers"),
             "proxy": payload.get("proxy"),
             "blockAds": payload.get("blockAds"),
             "fastMode": payload.get("fastMode"),
+            "artifact_mode": payload.get("artifact_mode") or payload.get("artifactMode"),
         }
     )
     raw = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
@@ -387,6 +1105,14 @@ def _is_cacheable_v2_scrape_data(data: Dict[str, Any]) -> bool:
     """
     if not isinstance(data, dict):
         return False
+    # Require at least one material content field. Metadata-only responses
+    # often represent transient upstream/network failures and should not be cached.
+    has_material_content = any(
+        data.get(field) not in (None, "", [])
+        for field in ("markdown", "html", "rawHtml", "links", "screenshot", "content_base64", "contentBase64")
+    )
+    if not has_material_content:
+        return False
     meta = data.get("metadata")
     if not isinstance(meta, dict):
         return True
@@ -398,7 +1124,85 @@ def _is_cacheable_v2_scrape_data(data: Dict[str, Any]) -> bool:
     return True
 
 
+def _v2_file_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
+    meta = data.get("metadata")
+    if not isinstance(meta, dict):
+        return {}
+    file_meta = meta.get("fileMetadata")
+    return file_meta if isinstance(file_meta, dict) else {}
+
+
+def _v2_action_results(data: Dict[str, Any]) -> list[Dict[str, Any]]:
+    file_meta = _v2_file_metadata(data)
+    action_results = file_meta.get("action_results")
+    if isinstance(action_results, list):
+        return [r for r in action_results if isinstance(r, dict)]
+    return []
+
+
+def _v2_has_action_generated_pdf(data: Dict[str, Any]) -> bool:
+    file_meta = _v2_file_metadata(data)
+    return bool(file_meta.get("generated_pdf"))
+
+
+def _v2_has_action_screenshot(data: Dict[str, Any]) -> bool:
+    for result in _v2_action_results(data):
+        action_type = result.get("type")
+        status = result.get("status")
+        if isinstance(action_type, str) and action_type.strip().lower() == "screenshot" and status == "success":
+            return True
+    return False
+
+
+def _extract_action_payloads(data: Dict[str, Any]) -> tuple[list[Dict[str, Any]] | None, Dict[str, Any] | None]:
+    action_results = _v2_action_results(data)
+    if not action_results:
+        return None, None
+
+    file_meta = _v2_file_metadata(data)
+    artifacts: Dict[str, Any] = {}
+    if _v2_has_action_generated_pdf(data) and isinstance(data.get("contentBase64"), str):
+        artifacts["generatedPdf"] = {
+            "encoding": "base64",
+            "location": "data.contentBase64",
+            "sizeBytes": file_meta.get("generated_pdf_bytes"),
+        }
+    if _v2_has_action_screenshot(data) and isinstance(data.get("screenshot"), str):
+        artifacts["actionScreenshot"] = {
+            "encoding": "base64",
+            "location": "data.screenshot",
+        }
+
+    return action_results, (artifacts or None)
+
+
+def _filter_v2_data_to_requested_formats(
+    data: Dict[str, Any],
+    options: ScrapeOptions,
+    *,
+    include_file_body: bool = False,
+) -> Dict[str, Any]:
+    filtered = dict(data or {})
+    requested = set(options.formats or ["markdown"])
+
+    if "markdown" not in requested and "content" not in requested:
+        filtered.pop("markdown", None)
+    if "html" not in requested:
+        filtered.pop("html", None)
+    if "rawHtml" not in requested:
+        filtered.pop("rawHtml", None)
+    if "links" not in requested:
+        filtered.pop("links", None)
+    if "screenshot" not in requested and not _v2_has_action_screenshot(filtered):
+        filtered.pop("screenshot", None)
+    if not include_file_body and not _v2_has_action_generated_pdf(filtered):
+        filtered.pop("contentBase64", None)
+
+    return filtered
+
+
 async def _v2_scrape_data(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    zero_data_retention = _coerce_bool(payload.get("zeroDataRetention"), False)
     max_age_raw = payload.get("maxAge")
     if max_age_raw is None:
         max_age_ms = int(getattr(settings, "cache_default_max_age_ms", 172800000))
@@ -409,6 +1213,9 @@ async def _v2_scrape_data(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             max_age_ms = int(getattr(settings, "cache_default_max_age_ms", 172800000))
 
     store_in_cache = _coerce_bool(payload.get("storeInCache"), True)
+    if zero_data_retention:
+        max_age_ms = 0
+        store_in_cache = False
 
     cache_key = _scrape_cache_key(url, payload)
     cached = _get_cached_scrape(cache_key, max_age_ms)
@@ -418,6 +1225,11 @@ async def _v2_scrape_data(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     options = _scrape_options_from_v2(payload)
     document = await scraper.scrape_url(url, options)
     data = _v2_document_from_v1(document)
+    data = _filter_v2_data_to_requested_formats(
+        data,
+        options,
+        include_file_body=bool(options.include_file_body),
+    )
     if store_in_cache and _is_cacheable_v2_scrape_data(data):
         _set_cached_scrape(cache_key, data)
     return data
@@ -489,6 +1301,13 @@ async def health_check():
         browserError=browser_status["browser_error"],
     )
 
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    content, content_type = metrics_response()
+    return Response(content=content, media_type=content_type)
+
 @app.post("/v1/scrape", response_model=ScrapeResponse)
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
 async def scrape_url(request: Request, scrape_request: ScrapeRequest, remote_addr: str = Depends(get_remote_address)):
@@ -532,20 +1351,162 @@ async def scrape_url(request: Request, scrape_request: ScrapeRequest, remote_add
 
 # --- Firecrawl v2 compatibility endpoints (for firecrawl-js v2 / firecrawl-mcp) ---
 
+def _v2_actions_capabilities() -> ActionsCapabilitiesResponse:
+    common_selector_field = ActionFieldCapability(
+        name="selector",
+        valueType="string",
+        required=False,
+        description="CSS selector for the target element.",
+    )
+    return ActionsCapabilitiesResponse(
+        actions=[
+            ActionCapability(type="wait", aliases=["sleep"], requestFields=[ActionFieldCapability(name="milliseconds", valueType="integer", description="Delay in milliseconds.")]),
+            ActionCapability(type="waitForSelector", aliases=["wait_for_selector"], requestFields=[common_selector_field]),
+            ActionCapability(type="waitForNavigation", aliases=["wait_for_navigation"], requestFields=[ActionFieldCapability(name="milliseconds", valueType="integer", description="Optional action timeout override in milliseconds.")]),
+            ActionCapability(type="click", requestFields=[common_selector_field, ActionFieldCapability(name="button", valueType="string", description="Mouse button: left/right/middle.")]),
+            ActionCapability(type="doubleClick", aliases=["double_click", "dblclick"], requestFields=[common_selector_field]),
+            ActionCapability(type="hover", requestFields=[common_selector_field]),
+            ActionCapability(type="type", aliases=["fill", "write"], requestFields=[common_selector_field, ActionFieldCapability(name="text", valueType="string", description="Text payload to type.")]),
+            ActionCapability(type="clear", aliases=["clearInput", "clear_input"], requestFields=[common_selector_field]),
+            ActionCapability(type="selectOption", aliases=["select", "select_option"], requestFields=[common_selector_field, ActionFieldCapability(name="value", valueType="string", description="Option value/text to select.")]),
+            ActionCapability(type="check", aliases=["tick"], requestFields=[common_selector_field]),
+            ActionCapability(type="uncheck", aliases=["untick"], requestFields=[common_selector_field]),
+            ActionCapability(type="press", aliases=["keyPress"], requestFields=[common_selector_field, ActionFieldCapability(name="key", valueType="string", description="Keyboard key, e.g. Enter or Shift+A.")]),
+            ActionCapability(type="keyDown", aliases=["key_down"], requestFields=[ActionFieldCapability(name="key", valueType="string", required=True)]),
+            ActionCapability(type="keyUp", aliases=["key_up"], requestFields=[ActionFieldCapability(name="key", valueType="string", required=True)]),
+            ActionCapability(type="scroll", requestFields=[ActionFieldCapability(name="direction", valueType="string", description="up/down/left/right/top/bottom"), ActionFieldCapability(name="milliseconds", valueType="integer")]),
+            ActionCapability(type="focus", requestFields=[common_selector_field]),
+            ActionCapability(type="blur", requestFields=[common_selector_field]),
+            ActionCapability(
+                type="dragAndDrop",
+                aliases=["drag_and_drop"],
+                requestFields=[
+                    common_selector_field,
+                    ActionFieldCapability(name="targetSelector", valueType="string", required=True, description="CSS selector for the drop target."),
+                ],
+            ),
+            ActionCapability(
+                type="navigate",
+                aliases=["goto", "go_to"],
+                requestFields=[ActionFieldCapability(name="url", valueType="string", description="Absolute URL to navigate to.")],
+                outputs=["output.url"],
+            ),
+            ActionCapability(
+                type="evaluate",
+                aliases=["script", "executeJavascript", "execute_javascript"],
+                requestFields=[ActionFieldCapability(name="script", valueType="string", required=True)],
+                outputs=["output"],
+            ),
+            ActionCapability(
+                type="screenshot",
+                requestFields=[common_selector_field, ActionFieldCapability(name="fullPage", valueType="boolean", description="For page-level screenshot when selector is not set.")],
+                outputs=["actionArtifacts.actionScreenshot", "data.screenshot"],
+            ),
+            ActionCapability(
+                type="generatePdf",
+                aliases=["generate_pdf"],
+                outputs=["actionArtifacts.generatedPdf", "data.contentBase64"],
+            ),
+            ActionCapability(type="scrape", notes="No-op marker action; final extraction occurs at end of /v2/scrape."),
+        ],
+        documentedRequestFields=[
+            "type",
+            "selector",
+            "targetSelector",
+            "text",
+            "value",
+            "url",
+            "key",
+            "button",
+            "script",
+            "milliseconds",
+            "direction",
+            "fullPage",
+        ],
+        documentedResponseFields=[
+            "actionResults[].index",
+            "actionResults[].type",
+            "actionResults[].status",
+            "actionResults[].reason",
+            "actionResults[].error",
+            "actionResults[].output",
+            "actionArtifacts.generatedPdf.encoding",
+            "actionArtifacts.generatedPdf.location",
+            "actionArtifacts.generatedPdf.sizeBytes",
+            "actionArtifacts.actionScreenshot.encoding",
+            "actionArtifacts.actionScreenshot.location",
+        ],
+    )
+
+
+@app.get("/v2/actions/capabilities", response_model=ActionsCapabilitiesResponse)
+@limiter.limit(V2_LIMIT_MAP)
+async def v2_actions_capabilities(request: Request, remote_addr: str = Depends(get_remote_address)):
+    _ = request, remote_addr
+    return _v2_actions_capabilities()
+
+
 @app.post("/v2/scrape")
-@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+@limiter.limit(V2_LIMIT_SCRAPE)
 async def v2_scrape(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
+    if settings.kill_switch_v2_scrape:
+        record_kill_switch("v2_scrape", "scrape")
+        return json_error(
+            "Scrape temporarily disabled by kill-switch",
+            status_code=503,
+            code="KILL_SWITCH_SCRAPE",
+        )
     url = payload.get("url")
     if not isinstance(url, str) or not url.strip():
-        return {"success": False, "error": "Missing url"}
+        return json_error("Missing url", code="MISSING_URL")
     parsed_url = urlparse(url)
     if not (parsed_url.scheme and parsed_url.netloc):
-        return {"success": False, "error": f"Invalid URL: {url}. Please include http:// or https://."}
+        return json_error(
+            f"Invalid URL: {url}. Please include http:// or https://.",
+            code="INVALID_URL",
+        )
+    if _is_ssrf_blocked_url(url):
+        record_security_deny("v2_scrape", "ssrf_blocked")
+        return json_error("Target URL blocked by SSRF policy", status_code=403, code="SSRF_BLOCKED")
     try:
         data = await _v2_scrape_data(url, payload)
-        return {"success": True, "data": data}
+        data, format_warnings = _augment_v2_data_with_format_objects(data, payload)
+        zero_data_retention = _coerce_bool(payload.get("zeroDataRetention"), False)
+        artifact_payload = payload
+        retention_warnings: list[str] = []
+        if zero_data_retention:
+            requested_mode = _artifact_mode_from_payload(payload)
+            if requested_mode and requested_mode.strip().lower() != "inline":
+                artifact_payload = dict(payload)
+                artifact_payload["artifact_mode"] = "inline"
+                retention_warnings.append(
+                    "artifact_mode forced to inline because zeroDataRetention=true"
+                )
+        transformed, artifact_meta = await _maybe_externalize_v2_artifacts(
+            request=request,
+            payload=artifact_payload,
+            data=data,
+        )
+        response_payload: Dict[str, Any] = {"success": True, "data": transformed, "artifactMode": artifact_meta["artifactMode"]}
+        action_results, action_artifacts = _extract_action_payloads(transformed)
+        if action_results is not None:
+            response_payload["actionResults"] = action_results
+        if action_artifacts is not None:
+            response_payload["actionArtifacts"] = action_artifacts
+        merged_warnings = format_warnings + retention_warnings
+        if merged_warnings:
+            response_payload["warning"] = "; ".join(merged_warnings)
+        if artifact_meta.get("artifactFallback"):
+            response_payload["artifactFallback"] = artifact_meta["artifactFallback"]
+        if artifact_meta.get("artifacts"):
+            response_payload["artifacts"] = artifact_meta["artifacts"]
+        if zero_data_retention:
+            response_payload["zeroDataRetentionApplied"] = True
+        return response_payload
+    except ValueError as e:
+        return json_error(str(e), code="INVALID_ARTIFACT_MODE")
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return json_error(str(e), status_code=500, code="INTERNAL_ERROR")
 
 @app.post("/v1/scrape/bulk", response_model=List[ScrapeResponse])
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
@@ -713,11 +1674,21 @@ async def export_crawl(job_id: str, format: str = "jsonl"):
 
 
 @app.post("/v2/crawl")
-@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+@limiter.limit(V2_LIMIT_CRAWL)
 async def v2_crawl(request: Request, payload: Dict[str, Any], background_tasks: BackgroundTasks, remote_addr: str = Depends(get_remote_address)):
+    if settings.kill_switch_v2_crawl:
+        record_kill_switch("v2_crawl", "crawl")
+        return json_error(
+            "Crawl temporarily disabled by kill-switch",
+            status_code=503,
+            code="KILL_SWITCH_CRAWL",
+        )
     url = payload.get("url")
     if not isinstance(url, str) or not url.strip():
-        return {"success": False, "error": "Missing url"}
+        return json_error("Missing url", code="MISSING_URL")
+    if _is_ssrf_blocked_url(url):
+        record_security_deny("v2_crawl", "ssrf_blocked")
+        return json_error("Target URL blocked by SSRF policy", status_code=403, code="SSRF_BLOCKED")
     try:
         idem_key = _get_idempotency_key(request)
         payload_hash = _payload_hash_for_idempotency(payload) if idem_key else ""
@@ -729,12 +1700,25 @@ async def v2_crawl(request: Request, payload: Dict[str, Any], background_tasks: 
         sitemap = payload.get("sitemap")
         ignore_sitemap = sitemap == "skip"
 
+        requested_limit = payload.get("limit") or 50
+        try:
+            requested_limit = int(requested_limit)
+        except Exception:
+            requested_limit = 50
+        if requested_limit > settings.budget_v2_crawl_limit_cap:
+            record_budget_guardrail("v2_crawl", "crawl_limit_cap", "blocked")
+            return json_error(
+                f"Requested crawl limit exceeds budget cap ({settings.budget_v2_crawl_limit_cap})",
+                code="BUDGET_LIMIT_EXCEEDED",
+                maxLimit=settings.budget_v2_crawl_limit_cap,
+            )
+
         crawl_request = CrawlRequest(
             url=url,
             include_paths=payload.get("includePaths"),
             exclude_paths=payload.get("excludePaths"),
             max_depth=payload.get("maxDiscoveryDepth") or 2,
-            limit=payload.get("limit") or 50,
+            limit=requested_limit,
             allow_external_links=payload.get("allowExternalLinks") or False,
             include_subdomains=payload.get("allowSubdomains") or False,
             ignore_sitemap=ignore_sitemap,
@@ -756,8 +1740,12 @@ async def v2_crawl(request: Request, payload: Dict[str, Any], background_tasks: 
             "credits_used": 0,
             "expires_at": utc_now() + timedelta(hours=24),
             "data": [],
+            "errors": [],
+            "robots_blocked": [],
+            "zero_data_retention": _coerce_bool(payload.get("zeroDataRetention"), False),
             "request": crawl_request.model_dump(),
             "v2_sitemap_mode": sitemap,
+            "tenant_id": _request_tenant_id(request),
         }
 
         if redis_available:
@@ -774,11 +1762,11 @@ async def v2_crawl(request: Request, payload: Dict[str, Any], background_tasks: 
     except HTTPException:
         raise
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return json_error(str(e), status_code=500, code="INTERNAL_ERROR")
 
 
 @app.get("/v2/crawl/{job_id}")
-async def v2_get_crawl_status(job_id: str):
+async def v2_get_crawl_status(request: Request, job_id: str):
     if redis_available:
         job_data_str = redis_client.get(f"crawl:{job_id}")
         if job_data_str:
@@ -789,46 +1777,88 @@ async def v2_get_crawl_status(job_id: str):
         job_data = job_storage.get(job_id)
 
     if not job_data:
-        raise HTTPException(status_code=404, detail="Crawl job not found")
+        return json_error("Crawl job not found", status_code=404, code="JOB_NOT_FOUND")
+    tenant_error = _enforce_job_tenant(request, job_data)
+    if tenant_error is not None:
+        return tenant_error
+
+    cursor_value = request.query_params.get("cursor") or request.query_params.get("next")
+    offset = _parse_status_cursor(cursor_value)
+    if offset is None:
+        return json_error("Invalid cursor", code="INVALID_CURSOR")
+    limit_raw = request.query_params.get("limit")
+    if limit_raw is None or not str(limit_raw).strip():
+        page_limit = 100
+    else:
+        try:
+            page_limit = int(limit_raw)
+        except Exception:
+            return json_error("Invalid limit", code="INVALID_LIMIT")
+    page_limit = min(1000, max(1, page_limit))
 
     expires_at = job_data.get("expires_at")
     expires_at_str = expires_at.isoformat() if isinstance(expires_at, datetime) else expires_at
     docs_in = job_data.get("data") or []
     docs_out = [_v2_document_from_v1(d) for d in docs_in]
+    paged_data = docs_out[offset : offset + page_limit]
+    next_cursor = f"offset:{offset + page_limit}" if (offset + page_limit) < len(docs_out) else None
 
-    return {
-        "success": True,
+    return _v2_status_payload(
+        {
         "status": job_data.get("status"),
         "completed": job_data.get("completed", 0),
         "total": job_data.get("total", 0),
         "creditsUsed": job_data.get("credits_used"),
         "expiresAt": expires_at_str,
-        "next": job_data.get("next"),
-        "data": docs_out,
-    }
+        "next": next_cursor,
+        "data": paged_data,
+        "zeroDataRetentionApplied": bool(job_data.get("zero_data_retention_applied")),
+        }
+    )
 
 
 @app.delete("/v2/crawl/{job_id}")
-async def v2_cancel_crawl(job_id: str):
+async def v2_cancel_crawl(request: Request, job_id: str):
     _cancelled_jobs.add(job_id)
     if redis_available:
         job_data_str = redis_client.get(f"crawl:{job_id}")
         if job_data_str:
             job_data = deserialize_job_data(job_data_str.decode("utf-8"))
+            tenant_error = _enforce_job_tenant(request, job_data)
+            if tenant_error is not None:
+                return tenant_error
             job_data.update({"status": "cancelled"})
             redis_client.set(f"crawl:{job_id}", serialize_job_data(job_data), ex=86400)
     else:
         job_data = job_storage.get(job_id)
         if job_data:
+            tenant_error = _enforce_job_tenant(request, job_data)
+            if tenant_error is not None:
+                return tenant_error
             job_data.update({"status": "cancelled"})
             job_storage[job_id] = job_data
-    return {"status": "cancelled"}
+    return _v2_cancel_payload("Crawl cancelled.")
 
 
 @app.get("/v2/crawl/{job_id}/errors")
-async def v2_crawl_errors(job_id: str):
-    # Minimal compatibility: return empty error set.
-    return {"success": True, "data": {"errors": [], "robotsBlocked": []}}
+async def v2_crawl_errors(request: Request, job_id: str):
+    if redis_available:
+        job_data_str = redis_client.get(f"crawl:{job_id}")
+        job_data = deserialize_job_data(job_data_str.decode("utf-8")) if job_data_str else None
+    else:
+        job_data = job_storage.get(job_id)
+    if not job_data:
+        return json_error("Crawl job not found", status_code=404, code="JOB_NOT_FOUND")
+    tenant_error = _enforce_job_tenant(request, job_data)
+    if tenant_error is not None:
+        return tenant_error
+    errors = job_data.get("errors") if isinstance(job_data.get("errors"), list) else []
+    robots_blocked = (
+        job_data.get("robots_blocked")
+        if isinstance(job_data.get("robots_blocked"), list)
+        else []
+    )
+    return _v2_errors_payload(errors=errors, robots_blocked=robots_blocked)
 
 @app.post("/v1/batch-scrape", response_model=BatchScrapeResponse)
 @limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
@@ -1006,11 +2036,14 @@ async def get_sitemap_links(url: str) -> List[str]:
 
 
 @app.post("/v2/map")
-@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+@limiter.limit(V2_LIMIT_MAP)
 async def v2_map(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
     url = payload.get("url")
     if not isinstance(url, str) or not url.strip():
-        return {"success": False, "error": "Missing url"}
+        return json_error("Missing url", code="MISSING_URL")
+    if _is_ssrf_blocked_url(url):
+        record_security_deny("v2_map", "ssrf_blocked")
+        return json_error("Target URL blocked by SSRF policy", status_code=403, code="SSRF_BLOCKED")
     try:
         links: list[str] = []
         seen: set[str] = set()
@@ -1061,17 +2094,29 @@ async def v2_map(request: Request, payload: Dict[str, Any], remote_addr: str = D
         if isinstance(limit, int) and limit > 0 and len(links) > limit:
             links = links[:limit]
 
-        return {"success": True, "links": links}
+        link_objects: list[Dict[str, Any]] = [
+            {
+                "url": link,
+                "title": None,
+                "description": None,
+            }
+            for link in links
+        ]
+        response_payload: Dict[str, Any] = {"success": True, "links": link_objects}
+        if not settings.strict_firecrawl_v2:
+            # Transitional compatibility path for legacy internal consumers.
+            response_payload["links_text"] = links
+        return response_payload
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return json_error(str(e), status_code=500, code="INTERNAL_ERROR")
 
 
 @app.post("/v2/batch/scrape")
-@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+@limiter.limit(V2_LIMIT_BATCH_SCRAPE)
 async def v2_batch_scrape(request: Request, payload: Dict[str, Any], background_tasks: BackgroundTasks, remote_addr: str = Depends(get_remote_address)):
     urls = payload.get("urls")
     if not isinstance(urls, list) or not urls:
-        return {"success": False, "error": "No URLs provided"}
+        return json_error("No URLs provided", code="MISSING_URLS")
 
     idem_key = _get_idempotency_key(request)
     payload_hash = _payload_hash_for_idempotency(payload) if idem_key else ""
@@ -1102,15 +2147,21 @@ async def v2_batch_scrape(request: Request, payload: Dict[str, Any], background_
     )
 
     invalid_urls: list[str] = []
+    blocked_urls: list[str] = []
     valid_urls: list[str] = []
     for u in batch_request.urls:
         parsed = urlparse(u)
-        if parsed.scheme and parsed.netloc:
+        if parsed.scheme and parsed.netloc and not _is_ssrf_blocked_url(u):
             valid_urls.append(u)
         else:
             invalid_urls.append(u)
+            if parsed.scheme and parsed.netloc:
+                blocked_urls.append(u)
     if not valid_urls:
-        return {"success": False, "error": "No valid URLs provided", "invalidURLs": invalid_urls}
+        if blocked_urls and len(blocked_urls) == len(invalid_urls):
+            record_security_deny("v2_batch_scrape", "ssrf_blocked")
+            return json_error("All URLs blocked by SSRF policy", status_code=403, code="SSRF_BLOCKED", invalidURLs=invalid_urls)
+        return json_error("No valid URLs provided", code="NO_VALID_URLS", invalidURLs=invalid_urls)
 
     job_id = str(uuid.uuid4())
     job_data = {
@@ -1121,8 +2172,12 @@ async def v2_batch_scrape(request: Request, payload: Dict[str, Any], background_
         "credits_used": 0,
         "expires_at": utc_now() + timedelta(hours=24),
         "data": [],
+        "errors": [],
+        "robots_blocked": [],
+        "zero_data_retention": _coerce_bool(payload.get("zeroDataRetention"), False),
         "request": payload,
         "valid_urls": valid_urls,
+        "tenant_id": _request_tenant_id(request),
     }
 
     job_key = f"batch:{job_id}"
@@ -1145,7 +2200,7 @@ async def v2_batch_scrape(request: Request, payload: Dict[str, Any], background_
 
 
 @app.get("/v2/batch/scrape/{job_id}")
-async def v2_get_batch_status(job_id: str):
+async def v2_get_batch_status(request: Request, job_id: str):
     job_key = f"batch:{job_id}"
     if redis_available:
         job_data_str = redis_client.get(job_key)
@@ -1157,326 +2212,444 @@ async def v2_get_batch_status(job_id: str):
         job_data = job_storage.get(job_key)
 
     if not job_data:
-        raise HTTPException(status_code=404, detail="Batch job not found")
+        return json_error("Batch job not found", status_code=404, code="JOB_NOT_FOUND")
+    tenant_error = _enforce_job_tenant(request, job_data)
+    if tenant_error is not None:
+        return tenant_error
+
+    cursor_value = request.query_params.get("cursor") or request.query_params.get("next")
+    offset = _parse_status_cursor(cursor_value)
+    if offset is None:
+        return json_error("Invalid cursor", code="INVALID_CURSOR")
+    limit_raw = request.query_params.get("limit")
+    if limit_raw is None or not str(limit_raw).strip():
+        page_limit = 100
+    else:
+        try:
+            page_limit = int(limit_raw)
+        except Exception:
+            return json_error("Invalid limit", code="INVALID_LIMIT")
+    page_limit = min(1000, max(1, page_limit))
 
     expires_at = job_data.get("expires_at")
     expires_at_str = expires_at.isoformat() if isinstance(expires_at, datetime) else expires_at
     docs_in = job_data.get("data") or []
     docs_out = [_v2_document_from_v1(d) for d in docs_in]
+    paged_data = docs_out[offset : offset + page_limit]
+    next_cursor = f"offset:{offset + page_limit}" if (offset + page_limit) < len(docs_out) else None
 
-    return {
-        "success": True,
+    return _v2_status_payload(
+        {
         "status": job_data.get("status"),
         "completed": job_data.get("completed", 0),
         "total": job_data.get("total", 0),
         "creditsUsed": job_data.get("credits_used"),
         "expiresAt": expires_at_str,
-        "next": job_data.get("next"),
-        "data": docs_out,
-    }
+        "next": next_cursor,
+        "data": paged_data,
+        "zeroDataRetentionApplied": bool(job_data.get("zero_data_retention_applied")),
+        }
+    )
 
 
 @app.delete("/v2/batch/scrape/{job_id}")
-async def v2_cancel_batch(job_id: str):
+async def v2_cancel_batch(request: Request, job_id: str):
     _cancelled_batch_jobs.add(job_id)
     job_key = f"batch:{job_id}"
     if redis_available:
         job_data_str = redis_client.get(job_key)
         if job_data_str:
             job_data = deserialize_job_data(job_data_str.decode("utf-8"))
+            tenant_error = _enforce_job_tenant(request, job_data)
+            if tenant_error is not None:
+                return tenant_error
             job_data.update({"status": "cancelled"})
             redis_client.set(job_key, serialize_job_data(job_data), ex=86400)
     else:
         job_data = job_storage.get(job_key)
         if job_data:
+            tenant_error = _enforce_job_tenant(request, job_data)
+            if tenant_error is not None:
+                return tenant_error
             job_data.update({"status": "cancelled"})
             job_storage[job_key] = job_data
-    return {"status": "cancelled"}
+    return _v2_cancel_payload("Batch scrape cancelled.")
 
 
 @app.get("/v2/batch/scrape/{job_id}/errors")
-async def v2_batch_errors(job_id: str):
-    return {"success": True, "data": {"errors": [], "robotsBlocked": []}}
+async def v2_batch_errors(request: Request, job_id: str):
+    job_key = f"batch:{job_id}"
+    if redis_available:
+        job_data_str = redis_client.get(job_key)
+        job_data = deserialize_job_data(job_data_str.decode("utf-8")) if job_data_str else None
+    else:
+        job_data = job_storage.get(job_key)
+    if not job_data:
+        return json_error("Batch job not found", status_code=404, code="JOB_NOT_FOUND")
+    tenant_error = _enforce_job_tenant(request, job_data)
+    if tenant_error is not None:
+        return tenant_error
+    errors = job_data.get("errors") if isinstance(job_data.get("errors"), list) else []
+    robots_blocked = (
+        job_data.get("robots_blocked")
+        if isinstance(job_data.get("robots_blocked"), list)
+        else []
+    )
+    return _v2_errors_payload(errors=errors, robots_blocked=robots_blocked)
 
 
 @app.post("/v2/search")
-@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
+@limiter.limit(V2_LIMIT_SEARCH)
 async def v2_search(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
     query = payload.get("query")
     if not isinstance(query, str) or not query.strip():
-        return {"success": False, "error": "Missing query"}
+        return json_error(
+            "Missing query",
+            code="MISSING_QUERY",
+            warning=None,
+            id=str(uuid.uuid4()),
+            creditsUsed=0,
+        )
     try:
-        limit = int(payload.get("limit") or 5)
+        request_id = str(uuid.uuid4())
+        warnings: list[str] = []
+        credits_used = 0
+        sources_succeeded = 0
+
+        try:
+            limit = int(payload.get("limit") or 5)
+        except Exception:
+            limit = 5
+            warnings.append("Invalid limit ignored; defaulting to 5")
         if limit <= 0:
             limit = 5
-        # Serper hard-limits are higher, but keep this conservative by default.
-        limit = min(limit, 20)
-        sources_in = payload.get("sources") or [{"type": "web"}]
-        sources: set[str] = set()
-        if isinstance(sources_in, list):
-            for s in sources_in:
-                if isinstance(s, str):
-                    sources.add(s)
-                elif isinstance(s, dict) and isinstance(s.get("type"), str):
-                    sources.add(s["type"])
-        if not sources:
-            sources = {"web"}
+            warnings.append("Non-positive limit ignored; defaulting to 5")
+        # Cap by configured budget guardrail to prevent runaway spend.
+        if limit > settings.budget_v2_search_limit_cap:
+            record_budget_guardrail("v2_search", "search_limit_cap", "capped")
+            warnings.append(
+                f"Requested limit capped by budget guardrail ({settings.budget_v2_search_limit_cap})"
+            )
+        limit = min(limit, settings.budget_v2_search_limit_cap)
+
+        supported_sources = {"web", "news", "images"}
+        raw_sources = payload.get("sources")
+        parsed_sources: set[str] = set()
+        if isinstance(raw_sources, list):
+            for idx, source_item in enumerate(raw_sources):
+                candidate: str | None = None
+                if isinstance(source_item, str):
+                    candidate = source_item.strip().lower()
+                elif isinstance(source_item, dict) and isinstance(source_item.get("type"), str):
+                    candidate = source_item["type"].strip().lower()
+                else:
+                    warnings.append(f"Invalid source entry at index {idx} ignored")
+                    continue
+
+                if not candidate:
+                    warnings.append(f"Empty source entry at index {idx} ignored")
+                elif candidate not in supported_sources:
+                    warnings.append(f"Unsupported source '{candidate}' ignored")
+                else:
+                    parsed_sources.add(candidate)
+
+        categories_in = payload.get("categories")
+        if isinstance(categories_in, list):
+            category_to_source = {
+                "web": "web",
+                "news": "news",
+                "image": "images",
+                "images": "images",
+            }
+            for raw_category in categories_in:
+                if not isinstance(raw_category, str):
+                    continue
+                mapped_source = category_to_source.get(raw_category.strip().lower())
+                if mapped_source is not None:
+                    parsed_sources.add(mapped_source)
+
+        if not parsed_sources:
+            parsed_sources = {"web"}
 
         data: Dict[str, Any] = {"web": [], "news": [], "images": []}
 
-        gl = payload.get("country") or payload.get("gl")
+        location = payload.get("location")
+        location_country = location.get("country") if isinstance(location, dict) else None
+        location_languages = location.get("languages") if isinstance(location, dict) else None
+        gl = payload.get("country") or payload.get("gl") or location_country
         hl = payload.get("lang") or payload.get("hl")
+        if not hl and isinstance(location_languages, list):
+            first_language = next((x for x in location_languages if isinstance(x, str) and x.strip()), None)
+            if first_language is not None:
+                hl = first_language.strip()
+
         tbs = payload.get("tbs")
+        ignore_invalid_urls = _coerce_bool(payload.get("ignoreInvalidURLs"), False)
+        timeout_in = payload.get("timeout")
+        timeout_seconds = _ms_to_seconds(timeout_in)
+        if timeout_in is not None and timeout_seconds is None:
+            warnings.append("Invalid timeout ignored")
 
         serper = SerperClient()
 
-        if "web" in sources:
-            res, _ = await serper.search(SerperSearchRequest(q=query, gl=gl, hl=hl, num=limit, tbs=tbs))
-            web_results: list[Dict[str, Any]] = []
-            if res.organic:
-                for r in res.organic[:limit]:
-                    if not r.link:
+        if "web" in parsed_sources:
+            try:
+                res, _ = await serper.search(SerperSearchRequest(q=query, gl=gl, hl=hl, num=limit, tbs=tbs))
+                credits_used += int(getattr(res, "credits_used", 1) or 1)
+                sources_succeeded += 1
+                web_results: list[Dict[str, Any]] = []
+                if res.organic:
+                    for r in res.organic[:limit]:
+                        if not r.link:
+                            if not ignore_invalid_urls:
+                                warnings.append("Dropped web result with missing url")
+                            continue
+                        web_results.append({"url": r.link, "title": r.title, "description": r.snippet})
+
+                scrape_opts_payload = payload.get("scrapeOptions") or {}
+                if not isinstance(scrape_opts_payload, dict):
+                    scrape_opts_payload = {}
+                    warnings.append("Invalid scrapeOptions ignored")
+                if timeout_in is not None and "timeout" not in scrape_opts_payload and timeout_seconds is not None:
+                    scrape_opts_payload["timeout"] = timeout_in
+
+                formats = scrape_opts_payload.get("formats")
+                if isinstance(formats, list) and len(formats) > 0:
+                    semaphore = asyncio.Semaphore(min(settings.max_concurrent_requests, 5))
+
+                    async def scrape_one(u: str):
+                        async with semaphore:
+                            try:
+                                scrape_payload = {"url": u, **scrape_opts_payload}
+                                return await _v2_scrape_data(u, scrape_payload)
+                            except Exception:
+                                return {"metadata": {"sourceURL": u, "statusCode": None}}
+
+                    data["web"] = await asyncio.gather(*[scrape_one(r["url"]) for r in web_results])
+                else:
+                    data["web"] = web_results
+            except Exception as e:
+                warnings.append(f"web source failed: {e}")
+
+        if "news" in parsed_sources:
+            try:
+                news_res, _ = await serper.news(SerperNewsRequest(q=query, gl=gl, hl=hl, num=limit))
+                credits_used += 1
+                sources_succeeded += 1
+                news_items = news_res.items[:limit] if isinstance(news_res.items, list) else []
+                out_news: list[Dict[str, Any]] = []
+                for idx, item in enumerate(news_items):
+                    if not isinstance(item, dict):
                         continue
-                    web_results.append({"url": r.link, "title": r.title, "description": r.snippet})
-
-            scrape_opts_payload = payload.get("scrapeOptions") or {}
-            formats = scrape_opts_payload.get("formats") if isinstance(scrape_opts_payload, dict) else None
-            if isinstance(formats, list) and len(formats) > 0:
-                semaphore = asyncio.Semaphore(min(settings.max_concurrent_requests, 5))
-
-                async def scrape_one(u: str):
-                    async with semaphore:
-                        try:
-                            scrape_payload = {"url": u, **(scrape_opts_payload if isinstance(scrape_opts_payload, dict) else {})}
-                            return await _v2_scrape_data(u, scrape_payload)
-                        except Exception:
-                            return {"metadata": {"sourceURL": u, "statusCode": None}}
-
-                data["web"] = await asyncio.gather(*[scrape_one(r["url"]) for r in web_results])
-            else:
-                data["web"] = web_results
-
-        if "news" in sources:
-            news_res, _ = await serper.news(SerperNewsRequest(q=query, gl=gl, hl=hl, num=limit))
-            news_items = news_res.items[:limit] if isinstance(news_res.items, list) else []
-            out_news: list[Dict[str, Any]] = []
-            for idx, item in enumerate(news_items):
-                if not isinstance(item, dict):
-                    continue
-                out_news.append(
-                    _remove_empty_top_level(
-                        {
-                            "title": item.get("title"),
-                            "url": item.get("link") or item.get("url"),
-                            "snippet": item.get("snippet") or item.get("description"),
-                            "date": item.get("date"),
-                            "imageUrl": item.get("imageUrl") or item.get("image"),
-                            "position": item.get("position") or (idx + 1),
-                            "category": item.get("source") or item.get("category"),
-                        }
+                    out_news.append(
+                        _remove_empty_top_level(
+                            {
+                                "title": item.get("title"),
+                                "url": item.get("link") or item.get("url"),
+                                "snippet": item.get("snippet") or item.get("description"),
+                                "date": item.get("date"),
+                                "imageUrl": item.get("imageUrl") or item.get("image"),
+                                "position": item.get("position") or (idx + 1),
+                                "category": item.get("source") or item.get("category"),
+                            }
+                        )
                     )
-                )
-            data["news"] = out_news
+                data["news"] = out_news
+            except Exception as e:
+                warnings.append(f"news source failed: {e}")
 
-        if "images" in sources:
-            img_res, _ = await serper.images(SerperImageRequest(q=query, gl=gl, hl=hl, num=limit))
-            img_items = img_res.items[:limit] if isinstance(img_res.items, list) else []
-            out_images: list[Dict[str, Any]] = []
-            for idx, item in enumerate(img_items):
-                if not isinstance(item, dict):
-                    continue
-                out_images.append(
-                    _remove_empty_top_level(
-                        {
-                            "title": item.get("title"),
-                            "imageUrl": item.get("imageUrl") or item.get("image"),
-                            "imageWidth": item.get("imageWidth") or item.get("imageWidthPx") or item.get("width"),
-                            "imageHeight": item.get("imageHeight") or item.get("imageHeightPx") or item.get("height"),
-                            "url": item.get("link") or item.get("url"),
-                            "position": item.get("position") or (idx + 1),
-                        }
+        if "images" in parsed_sources:
+            try:
+                img_res, _ = await serper.images(SerperImageRequest(q=query, gl=gl, hl=hl, num=limit))
+                credits_used += 1
+                sources_succeeded += 1
+                img_items = img_res.items[:limit] if isinstance(img_res.items, list) else []
+                out_images: list[Dict[str, Any]] = []
+                for idx, item in enumerate(img_items):
+                    if not isinstance(item, dict):
+                        continue
+                    out_images.append(
+                        _remove_empty_top_level(
+                            {
+                                "title": item.get("title"),
+                                "imageUrl": item.get("imageUrl") or item.get("image"),
+                                "imageWidth": item.get("imageWidth") or item.get("imageWidthPx") or item.get("width"),
+                                "imageHeight": item.get("imageHeight") or item.get("imageHeightPx") or item.get("height"),
+                                "url": item.get("link") or item.get("url"),
+                                "position": item.get("position") or (idx + 1),
+                            }
+                        )
                     )
-                )
-            data["images"] = out_images
+                data["images"] = out_images
+            except Exception as e:
+                warnings.append(f"images source failed: {e}")
 
-        return {"success": True, "data": data}
+        deduped_warnings = list(dict.fromkeys(warnings))
+        warning_value = "; ".join(deduped_warnings) if deduped_warnings else None
+        if sources_succeeded == 0:
+            return json_error(
+                "Search failed",
+                status_code=502,
+                code="UPSTREAM_SEARCH_FAILED",
+                warning=warning_value,
+                id=request_id,
+                creditsUsed=credits_used,
+            )
+
+        return {
+            "success": True,
+            "data": data,
+            "warning": warning_value,
+            "id": request_id,
+            "creditsUsed": credits_used,
+        }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return json_error(
+            str(e),
+            status_code=500,
+            code="INTERNAL_ERROR",
+            warning=None,
+            id=str(uuid.uuid4()),
+            creditsUsed=0,
+        )
 
 
 @app.post("/v2/extract")
-@limiter.limit(f"{settings.rate_limit_requests}/{settings.rate_limit_window}seconds")
-async def v2_extract(request: Request, payload: Dict[str, Any], remote_addr: str = Depends(get_remote_address)):
+@limiter.limit(V2_LIMIT_EXTRACT)
+async def v2_extract(
+    request: Request,
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    remote_addr: str = Depends(get_remote_address),
+):
     urls = payload.get("urls")
     if not isinstance(urls, list) or not urls:
-        return {"success": False, "error": "No URLs provided"}
-    try:
-        scrape_opts_payload = payload.get("scrapeOptions") or {}
-        options = _scrape_options_from_v2(scrape_opts_payload)
-        semaphore = asyncio.Semaphore(min(settings.max_concurrent_requests, 5))
-
-        async def scrape_one(u: str):
-            async with semaphore:
-                try:
-                    doc = await scraper.scrape_url(str(u), options)
-                    return _v2_document_from_v1(doc)
-                except Exception:
-                    return {"metadata": {"sourceURL": str(u), "statusCode": None}}
-
-        docs = await asyncio.gather(*[scrape_one(u) for u in urls])
-        return {"success": True, "status": "completed", "data": {"documents": docs}}
-    except Exception as e:
-        return {"success": False, "status": "failed", "error": str(e)}
-
-
-# --- Hermes endpoints ---
-
-@app.post("/v1/hermes/leads/search", response_model=HermesSearchResponse)
-async def hermes_search(req: HermesSearchRequest):
-    try:
-        serper = SerperClient()
-        res, _ = await serper.search(SerperSearchRequest(q=req.query, gl=req.gl, hl=req.hl, num=req.limit))
-        results = []
-        if res.organic:
-            for r in res.organic:
-                results.append({"title": r.title, "link": r.link, "snippet": r.snippet, "date": r.date})
-        return HermesSearchResponse(success=True, leads=results, total=len(results))
-    except Exception as e:
-        return HermesSearchResponse(success=False, error=str(e))
-
-
-@app.post("/v1/hermes/compose", response_model=HermesComposeResponse)
-async def hermes_compose(req: HermesComposeRequest):
-    try:
-        openrouter = OpenRouterClient()
-        messages = []
-        if req.system:
-            messages.append(ORMessage(role="system", content=req.system))
-        messages.append(ORMessage(role="user", content=req.prompt))
-        chat, _ = await openrouter.chat_completions(OpenRouterChatRequest(
-            model=req.model, messages=messages, max_tokens=req.max_tokens, temperature=req.temperature
-        ))
-        text = chat.choices[0].message.content if chat.choices else None
-        return HermesComposeResponse(success=True, content=text)
-    except Exception as e:
-        return HermesComposeResponse(success=False, error=str(e))
-
-
-@app.post("/v1/hermes/external-scrape", response_model=HermesExternalScrapeResponse)
-async def hermes_external_scrape(req: HermesExternalScrapeRequest):
-    try:
-        client = ScrapeDoClient()
-        out, _ = await client.fetch(ScrapeDoRequest(url=req.url, render_js=bool(req.render_js), timeout_ms=int(req.timeout_ms or 30000), geo_code=req.geo_code))
-        return HermesExternalScrapeResponse(success=True, status_code=out.status_code, content_type=out.content_type, content=out.content)
-    except Exception as e:
-        # Surface ProviderError details if available
-        status = getattr(e, "status_code", None)
-        payload = getattr(e, "payload", None)
-        
-        # Check for specific Scrape.do plan limitations
-        if status == 401 and payload:
-            if "Geo Targeting is not included" in payload:
-                msg = "Scrape.do API: GeoCode feature not available in current plan"
-            elif "JS Render is not included" in payload:
-                msg = "Scrape.do API: JavaScript rendering not available in current plan"
-            else:
-                if len(payload) > 400:
-                    payload = payload[:400] + "..."
-                msg = f"Scrape.do error: {payload}"
-        else:
-            if payload and isinstance(payload, str) and len(payload) > 400:
-                payload = payload[:400] + "..."
-            msg = str(e)
-            if status:
-                msg = f"{msg} (status={status})"
-        return HermesExternalScrapeResponse(success=False, status_code=status, content_type=None, content=None, error=msg)
-
-
-@app.post("/v1/hermes/leads/enrich", response_model=HermesEnrichResponse)
-async def hermes_enrich(req: HermesEnrichRequest):
-    try:
-        opts_dict = req.scrapeOptions or {}
-        # Map incoming options dict into ScrapeOptions fields where possible
-        options = ScrapeOptions(**{k: v for k, v in opts_dict.items() if k in ScrapeOptions.model_fields})
-        docs = []
-        for domain in req.domains:
-            url = domain if domain.startswith("http") else f"https://{domain}"
-            doc = await scraper.scrape_url(url, options)
-            docs.append(doc)
-        return HermesEnrichResponse(success=True, domains=docs)
-    except Exception as e:
-        return HermesEnrichResponse(success=False, error=str(e))
-
-
-@app.post("/v1/hermes/research")
-async def hermes_research(body: dict):
-    try:
-        # Keep Hermes compatibility path optional in standalone CandleCrawl.
-        from app.hermes_bcas import HermesBStar04
-
-        question = body.get("question") or body.get("query")
-        max_searches = int(body.get("max_searches", 3))
-        model = body.get("model", "openai/gpt-5-nano")
-        
-        # Cost tracking parameters
-        job_id = body.get("job_id", str(uuid.uuid4()))
-        tier = body.get("tier", "TARGETED")  # Default tier
-        
-        # Contact extraction configuration
-        contact_extraction = None
-        if body.get("contact_extraction"):
-            from app.models import ContactExtractionConfig
-            contact_extraction = ContactExtractionConfig(**body["contact_extraction"])
-        
-        # Optional budgets and toggles (native to BCAS)
-        method_kwargs = {
-            "max_total_tokens": int(body.get("max_total_tokens", 8000)),
-            "max_responses": int(body.get("max_responses", 25)),
-            "tell_search_limit": bool(body.get("tell_search_limit", True)),
-            "tell_context_limit": bool(body.get("tell_context_limit", True)),
-            "search_limit": int(body.get("search_limit", 5)),
-            "use_intermittent_reasoning": bool(body.get("use_intermittent_reasoning", False)),
-            "use_preplanning": bool(body.get("use_preplanning", True)),
-            "max_completion_tokens": int(body.get("max_completion_tokens", 2048)),
-            "enforce_tier_length": bool(body.get("enforce_tier_length", False)),
-            "debug_trace_level": str(body.get("debug_trace_level", "summary")),
-            "force_direct_scrape": bool(body.get("force_direct_scrape", False)),
-        }
-        debug_trace = bool(body.get("debug_trace", False))
-        
-        # Initialize engine with cost tracking
-        engine = HermesBStar04(
-            model=model, 
-            job_id=job_id,
-            tier=tier,
-            contact_extraction=contact_extraction,
-            **method_kwargs
+        return json_error("No URLs provided", code="MISSING_URLS")
+    if len(urls) > settings.budget_v2_extract_url_cap:
+        record_budget_guardrail("v2_extract", "extract_url_cap", "blocked")
+        return json_error(
+            f"Requested URL count exceeds budget cap ({settings.budget_v2_extract_url_cap})",
+            code="EXTRACT_BUDGET_EXCEEDED",
+            maxURLs=settings.budget_v2_extract_url_cap,
         )
-        
-        result = await engine.run_async(question, max_searches)
-        if debug_trace and engine.cost_tracker:
-            result["trace"] = engine.cost_tracker.get_trace()
-        return {"success": True, **result}
-    except Exception as e:
-        err = {"success": False, "error": str(e)}
-        # Surface ProviderError details when available
-        status = getattr(e, "status_code", None)
-        payload = getattr(e, "payload", None)
-        if status or payload:
-            if isinstance(payload, str) and len(payload) > 800:
-                payload = payload[:800] + "..."
-            err["error_details"] = {"status_code": status, "payload": payload}
-        # Attach trace if any
-        try:
-            if 'engine' in locals() and engine and engine.cost_tracker:
-                err["trace"] = engine.cost_tracker.get_trace()
-        except Exception:
-            pass
-        return err
+
+    idem_key = _get_idempotency_key(request)
+    payload_hash = _payload_hash_for_idempotency(payload) if idem_key else ""
+    if idem_key:
+        existing = _get_idempotent_response("v2:extract", idem_key, payload_hash)
+        if existing is not None:
+            return existing
+
+    invalid_urls: list[str] = []
+    blocked_urls: list[str] = []
+    valid_urls: list[str] = []
+    for u in urls:
+        parsed = urlparse(str(u))
+        if parsed.scheme and parsed.netloc and not _is_ssrf_blocked_url(str(u)):
+            valid_urls.append(str(u))
+        else:
+            invalid_urls.append(str(u))
+            if parsed.scheme and parsed.netloc:
+                blocked_urls.append(str(u))
+
+    if not valid_urls:
+        if blocked_urls and len(blocked_urls) == len(invalid_urls):
+            record_security_deny("v2_extract", "ssrf_blocked")
+            return json_error("All URLs blocked by SSRF policy", status_code=403, code="SSRF_BLOCKED", invalidURLs=invalid_urls)
+        return json_error("No valid URLs provided", code="NO_VALID_URLS", invalidURLs=invalid_urls)
+
+    job_id = str(uuid.uuid4())
+    job_data = {
+        "id": job_id,
+        "status": "processing",
+        "completed": 0,
+        "total": len(valid_urls),
+        "credits_used": 0,
+        "expires_at": utc_now() + timedelta(hours=24),
+        "data": {"documents": [], "errors": []},
+        "invalid_urls": invalid_urls,
+        "zero_data_retention": _coerce_bool(payload.get("zeroDataRetention"), False),
+        "request": payload,
+        "valid_urls": valid_urls,
+        "tenant_id": _request_tenant_id(request),
+    }
+
+    extract_job_key = f"extract:{job_id}"
+    if redis_available:
+        redis_client.set(extract_job_key, serialize_job_data(job_data), ex=86400)
+    else:
+        job_storage[extract_job_key] = job_data
+
+    background_tasks.add_task(extract_background_task, job_id, valid_urls, payload)
+
+    response = {
+        "success": True,
+        "id": job_id,
+        "invalidURLs": invalid_urls or None,
+    }
+    if idem_key:
+        _set_idempotent_response("v2:extract", idem_key, payload_hash, response)
+    return response
+
+
+@app.get("/v2/extract/{job_id}")
+async def v2_extract_status(request: Request, job_id: str):
+    extract_job_key = f"extract:{job_id}"
+    if redis_available:
+        job_data_str = redis_client.get(extract_job_key)
+        if job_data_str:
+            job_data = deserialize_job_data(job_data_str.decode("utf-8"))
+        else:
+            job_data = None
+    else:
+        job_data = job_storage.get(extract_job_key)
+
+    if not job_data:
+        return json_error("Extract job not found", status_code=404, code="JOB_NOT_FOUND")
+    tenant_error = _enforce_job_tenant(request, job_data)
+    if tenant_error is not None:
+        return tenant_error
+
+    expires_at = job_data.get("expires_at")
+    expires_at_str = expires_at.isoformat() if isinstance(expires_at, datetime) else expires_at
+    return _v2_status_payload(
+        {
+        "id": job_data.get("id", job_id),
+        "status": job_data.get("status"),
+        "completed": job_data.get("completed", 0),
+        "total": job_data.get("total", 0),
+        "creditsUsed": job_data.get("credits_used", 0),
+        "expiresAt": expires_at_str,
+        "next": job_data.get("next"),
+        "data": job_data.get("data"),
+        "invalidURLs": job_data.get("invalid_urls"),
+        "error": job_data.get("error"),
+        "zeroDataRetentionApplied": bool(job_data.get("zero_data_retention_applied")),
+        }
+    )
+
+
+# --- Retired Hermes compatibility surface ---
+
+@app.api_route(
+    "/v1/hermes/{legacy_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+async def retired_hermes_compat_endpoint(legacy_path: str):
+    return json_error(
+        "CandleCrawl no longer serves /v1/hermes compatibility endpoints. "
+        "Use the CandleCrawl-native /v2 API surface instead.",
+        status_code=410,
+        code="HERMES_COMPAT_RETIRED",
+        legacyPath=f"/v1/hermes/{legacy_path}",
+        migrationTarget="/v2",
+    )
 
 async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
     """Background task for crawling with depth and concurrency control."""
     start_time = time.time()
+    job_data: Dict[str, Any] = {"id": job_id}
     try:
         # Get job data from storage
         if redis_available:
@@ -1506,6 +2679,9 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
         frontier = MemoryFrontier()
         crawled_urls: set[str] = set()
         results: list[FirecrawlDocument] = []
+        crawl_errors: list[Dict[str, Any]] = []
+        robots_blocked: set[str] = set()
+        error_lock = asyncio.Lock()
         start_parsed = urlparse(canon(crawl_request.url))
         base_domain = start_parsed.netloc
         start_job_time = time.time()
@@ -1568,6 +2744,12 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                 return
             await frontier.enqueue(u, depth)
 
+        async def _record_crawl_error(url: str, error: str, *, blocked_reason: str | None = None) -> None:
+            async with error_lock:
+                crawl_errors.append(_make_job_error_item(url, error))
+                if blocked_reason == "robots_disallow":
+                    robots_blocked.add(url)
+
         # Seed with start URL unconditionally (bypass path/domain filters)
         await frontier.enqueue(canon(crawl_request.url), 0)
         # Seed with sitemap links if allowed
@@ -1606,6 +2788,11 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                         ua = (options.headers or {}).get("User-Agent") or settings.user_agent or "*"
                         if not rp.can_fetch(ua, url):
                             logger.info(f"Worker {worker_id}: Disallowed by robots.txt {url}")
+                            await _record_crawl_error(
+                                url,
+                                "Blocked by robots.txt policy",
+                                blocked_reason="robots_disallow",
+                            )
                             continue
                     except Exception:
                         # If robots cannot be fetched/parsed, proceed
@@ -1696,12 +2883,20 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
                         # Heuristic blocked detection
                         meta = DocumentMetadata(source_url=url, status_code=None)
                         msg = str(e).lower()
+                        blocked_reason = None
                         if any(k in msg for k in ["captcha", "recaptcha"]):
-                            meta.blocked = True; meta.blocked_reason = "captcha"
+                            blocked_reason = "captcha"
+                            meta.blocked = True
+                            meta.blocked_reason = blocked_reason
                         elif any(k in msg for k in ["forbidden", "403", "blocked"]):
-                            meta.blocked = True; meta.blocked_reason = "ip_block"
+                            blocked_reason = "ip_block"
+                            meta.blocked = True
+                            meta.blocked_reason = blocked_reason
                         elif any(k in msg for k in ["too many requests", "429", "rate limit"]):
-                            meta.blocked = True; meta.blocked_reason = "rate_limited"
+                            blocked_reason = "rate_limited"
+                            meta.blocked = True
+                            meta.blocked_reason = blocked_reason
+                        await _record_crawl_error(url, str(e), blocked_reason=blocked_reason)
                         results.append(FirecrawlDocument(url=url, metadata=meta))
                     finally:
                         # Optional polite delay between tasks per worker
@@ -1745,13 +2940,25 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
         await asyncio.gather(*workers, return_exceptions=True)
 
         # --- Finalize Job ---
+        zero_data_retention = bool(job_data.get("zero_data_retention"))
+        persisted_docs = [] if zero_data_retention else [doc.model_dump() for doc in results]
+        credits_used = _estimate_documents_credits(results)
         job_data.update({
             "status": final_status,
             "completed": len(results),
             "total": len(crawled_urls), # Total unique URLs encountered
-            "data": [doc.model_dump() for doc in results]
+            "credits_used": credits_used,
+            "data": persisted_docs,
+            "errors": crawl_errors,
+            "robots_blocked": sorted(robots_blocked),
+            "zero_data_retention_applied": zero_data_retention,
         })
-        
+        job_data["webhook_delivery"] = await _deliver_job_webhook(
+            job_type="crawl",
+            job_id=job_id,
+            job_data=job_data,
+        )
+
         if redis_available:
             redis_client.set(f"crawl:{job_id}", serialize_job_data(job_data), ex=86400)
         else:
@@ -1763,6 +2970,11 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
     except Exception as e:
         logger.error(f"Crawl job {job_id} failed: {e}", exc_info=True)
         job_data.update({"status": "failed", "error": str(e)})
+        job_data["webhook_delivery"] = await _deliver_job_webhook(
+            job_type="crawl",
+            job_id=job_id,
+            job_data=job_data,
+        )
         
         if redis_available:
             redis_client.set(f"crawl:{job_id}", serialize_job_data(job_data), ex=86400)
@@ -1771,6 +2983,7 @@ async def crawl_background_task(job_id: str, crawl_request: CrawlRequest):
 
 async def batch_scrape_background_task(job_id: str, urls: List[str], batch_request: BatchScrapeRequest):
     """Background task for batch scraping"""
+    job_data: Dict[str, Any] = {"id": job_id}
     try:
         # Convert request to scrape options
         options = ScrapeOptions(
@@ -1788,7 +3001,8 @@ async def batch_scrape_background_task(job_id: str, urls: List[str], batch_reque
         )
         
         results = []
-        completed = 0
+        batch_errors: list[Dict[str, Any]] = []
+        robots_blocked: set[str] = set()
         
         # Process URLs with concurrency control
         semaphore = asyncio.Semaphore(batch_request.max_concurrency or 5)
@@ -1796,16 +3010,37 @@ async def batch_scrape_background_task(job_id: str, urls: List[str], batch_reque
         async def scrape_with_semaphore(url: str):
             async with semaphore:
                 try:
-                    return await scraper.scrape_url(url, options)
+                    return {"url": url, "document": await scraper.scrape_url(url, options), "error": None}
                 except Exception as e:
-                    return FirecrawlDocument(
-                        url=url,
-                        metadata=DocumentMetadata(source_url=url, status_code=None)
-                    )
+                    return {"url": url, "document": None, "error": str(e)}
         
         # Execute all scraping tasks
         tasks = [scrape_with_semaphore(url) for url in urls]
-        results = await asyncio.gather(*tasks)
+        gathered = await asyncio.gather(*tasks)
+        for item in gathered:
+            url = item.get("url")
+            document = item.get("document")
+            error = item.get("error")
+            if document is not None:
+                try:
+                    meta = getattr(document, "metadata", None)
+                    blocked = bool(getattr(meta, "blocked", False)) if meta is not None else False
+                    blocked_reason = getattr(meta, "blocked_reason", None) if meta is not None else None
+                    if blocked:
+                        batch_errors.append(
+                            _make_job_error_item(
+                                str(url),
+                                f"Blocked during scrape ({blocked_reason or 'unknown'})",
+                            )
+                        )
+                    if blocked_reason == "robots_disallow":
+                        robots_blocked.add(str(url))
+                except Exception:
+                    pass
+                results.append(document)
+                continue
+
+            batch_errors.append(_make_job_error_item(str(url), str(error or "Unknown scrape error")))
         
         # Update job with results
         job_key = f"batch:{job_id}"
@@ -1824,11 +3059,23 @@ async def batch_scrape_background_task(job_id: str, urls: List[str], batch_reque
         if job_id in _cancelled_batch_jobs or job_data.get("status") == "cancelled":
             return
         
+        zero_data_retention = bool(job_data.get("zero_data_retention"))
+        persisted_docs = [] if zero_data_retention else [doc.model_dump() for doc in results]
+        credits_used = _estimate_documents_credits(results)
         job_data.update({
             "status": "completed",
             "completed": len(results),
-            "data": [doc.model_dump() for doc in results]
+            "credits_used": credits_used,
+            "data": persisted_docs,
+            "errors": batch_errors,
+            "robots_blocked": sorted(robots_blocked),
+            "zero_data_retention_applied": zero_data_retention,
         })
+        job_data["webhook_delivery"] = await _deliver_job_webhook(
+            job_type="batch_scrape",
+            job_id=job_id,
+            job_data=job_data,
+        )
         
         # Store updated job data
         if redis_available:
@@ -1852,7 +3099,123 @@ async def batch_scrape_background_task(job_id: str, urls: List[str], batch_reque
             "status": "failed",
             "error": str(e)
         })
+        job_data["webhook_delivery"] = await _deliver_job_webhook(
+            job_type="batch_scrape",
+            job_id=job_id,
+            job_data=job_data,
+        )
         
+        if redis_available:
+            redis_client.set(job_key, serialize_job_data(job_data), ex=86400)
+        else:
+            job_storage[job_key] = job_data
+
+
+async def extract_background_task(job_id: str, urls: List[str], payload: Dict[str, Any]):
+    job_key = f"extract:{job_id}"
+    job_data: Dict[str, Any] = {"id": job_id}
+    try:
+        scrape_opts_payload = payload.get("scrapeOptions") or {}
+        if not isinstance(scrape_opts_payload, dict):
+            scrape_opts_payload = {}
+        options = _scrape_options_from_v2(scrape_opts_payload)
+
+        show_sources = _coerce_bool(payload.get("showSources"), False)
+        schema_payload = payload.get("schema")
+        prompt_payload = payload.get("prompt")
+        results: list[Dict[str, Any]] = []
+        errors: list[Dict[str, Any]] = []
+        credits_used = 0
+
+        for u in urls:
+            try:
+                doc = await scraper.scrape_url(str(u), options)
+                source_doc = _v2_document_from_v1(doc)
+                extracted_payload: Dict[str, Any] = {
+                    "url": str(u),
+                    "content": source_doc.get("markdown") or source_doc.get("html"),
+                }
+                # Preserve user intent for later upgraded extraction implementation.
+                if isinstance(schema_payload, dict) and schema_payload:
+                    extracted_payload["schema"] = schema_payload
+                if isinstance(prompt_payload, str) and prompt_payload.strip():
+                    extracted_payload["prompt"] = prompt_payload
+                row: Dict[str, Any] = {"url": str(u), "data": _remove_empty_top_level(extracted_payload)}
+                if show_sources:
+                    row["source"] = source_doc
+                results.append(row)
+                credits_used += _estimate_document_credits(source_doc)
+            except Exception as e:
+                errors.append({"url": str(u), "error": str(e)})
+
+            if redis_available:
+                job_data_str = redis_client.get(job_key)
+                job_data = deserialize_job_data(job_data_str.decode("utf-8")) if job_data_str else None
+            else:
+                job_data = job_storage.get(job_key)
+            if not job_data:
+                continue
+
+            zero_data_retention = bool(job_data.get("zero_data_retention"))
+            job_data.update(
+                {
+                    "status": "processing",
+                    "completed": len(results) + len(errors),
+                    "credits_used": credits_used,
+                    "data": {"documents": ([] if zero_data_retention else results), "errors": errors},
+                    "zero_data_retention_applied": zero_data_retention,
+                }
+            )
+            if redis_available:
+                redis_client.set(job_key, serialize_job_data(job_data), ex=86400)
+            else:
+                job_storage[job_key] = job_data
+
+        if redis_available:
+            job_data_str = redis_client.get(job_key)
+            job_data = deserialize_job_data(job_data_str.decode("utf-8")) if job_data_str else None
+        else:
+            job_data = job_storage.get(job_key)
+        if not job_data:
+            return
+
+        final_status = "completed" if results else "failed"
+        zero_data_retention = bool(job_data.get("zero_data_retention"))
+        job_data.update(
+            {
+                "status": final_status,
+                "completed": len(results) + len(errors),
+                "credits_used": credits_used,
+                "data": {"documents": ([] if zero_data_retention else results), "errors": errors},
+                "zero_data_retention_applied": zero_data_retention,
+            }
+        )
+        if final_status == "failed" and not job_data.get("error"):
+            job_data["error"] = "Extraction failed for all URLs"
+        job_data["webhook_delivery"] = await _deliver_job_webhook(
+            job_type="extract",
+            job_id=job_id,
+            job_data=job_data,
+        )
+
+        if redis_available:
+            redis_client.set(job_key, serialize_job_data(job_data), ex=86400)
+        else:
+            job_storage[job_key] = job_data
+    except Exception as e:
+        if redis_available:
+            job_data_str = redis_client.get(job_key)
+            job_data = deserialize_job_data(job_data_str.decode("utf-8")) if job_data_str else None
+        else:
+            job_data = job_storage.get(job_key)
+        if not job_data:
+            job_data = {"id": job_id}
+        job_data.update({"status": "failed", "error": str(e)})
+        job_data["webhook_delivery"] = await _deliver_job_webhook(
+            job_type="extract",
+            job_id=job_id,
+            job_data=job_data,
+        )
         if redis_available:
             redis_client.set(job_key, serialize_job_data(job_data), ex=86400)
         else:

@@ -2,7 +2,7 @@ import asyncio
 import base64
 import io
 import re
-from typing import List, Optional
+from typing import Any, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -22,6 +22,8 @@ from playwright.async_api import (
 from app.config import settings
 from app.http_client import ResilientHttpClient
 from app.models import FirecrawlDocument, DocumentMetadata, ScrapeOptions, ScrapeAction
+from app.providers.base import ProviderError
+from app.providers.document_ocr import document_ocr_client
 
 class ScrapingService:
     def __init__(self):
@@ -90,21 +92,22 @@ class ScrapingService:
     async def scrape_url(self, url: str, options: ScrapeOptions = None) -> FirecrawlDocument:
         if options is None:
             options = ScrapeOptions()
+        verify_tls = not bool(options.skip_tls_verification)
 
         try:
             # 1. Make a HEAD request to check content type first
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=15, verify=verify_tls) as client:
                 headers = {"User-Agent": settings.user_agent, **(options.headers or {})}
                 head_response = await client.head(url, headers=headers, follow_redirects=True)
                 head_response.raise_for_status()
                 content_type = head_response.headers.get('content-type', '').lower()
 
             # 2. Route to the correct handler based on content type
-            if 'text/html' in content_type:
+            if self._is_html_like_content_type(url, content_type):
                 return await self._scrape_html_page(url, options)
             else:
                 logger.info(f"Detected file content-type '{content_type}'. Routing to file handler.")
-                return await self._get_file_metadata(url, head_response.headers, options)
+                return await self._get_file_metadata(url, head_response.headers, options, verify_tls=verify_tls)
 
         except Exception as e:
             logger.error(f"Error scraping {url}: {str(e)}")
@@ -114,6 +117,11 @@ class ScrapingService:
                     f"HEAD request blocked ({e.response.status_code}); escalating to browser/GET scrape for {url}"
                 )
                 return await self._scrape_html_page(url, options)
+            # HEAD transport failures are frequently transient and should not
+            # immediately degrade into metadata-only responses.
+            if isinstance(e, httpx.RequestError):
+                logger.warning(f"HEAD request transport failure for {url}; falling back to GET/browser scrape.")
+                return await self._scrape_html_page(url, options)
             if isinstance(e, httpx.UnsupportedProtocol) or "Method 'HEAD' not allowed" in str(e):
                 logger.warning(f"HEAD request failed for {url}, falling back to GET-based HTML scraping.")
                 return await self._scrape_html_page(url, options)
@@ -121,6 +129,18 @@ class ScrapingService:
                 url=url,
                 metadata=DocumentMetadata(source_url=url, status_code=getattr(e, 'response', None) and getattr(e.response, 'status_code', None))
             )
+
+    def _is_html_like_content_type(self, url: str, content_type: str) -> bool:
+        normalized = (content_type or "").lower()
+        if "text/html" in normalized or "application/xhtml+xml" in normalized:
+            return True
+
+        # Some sites mislabel HTML as text/plain or omit a useful content-type.
+        path = (urlparse(url).path or "").lower()
+        if path.endswith(".html") or path.endswith(".htm") or path.endswith(".xhtml"):
+            return True
+
+        return False
 
     def _needs_browser_rendering(self, options: ScrapeOptions) -> bool:
         return (
@@ -138,7 +158,11 @@ class ScrapingService:
         
         timeout = timeout_override or options.timeout or settings.default_timeout
         
-        client = ResilientHttpClient(timeout=timeout, follow_redirects=True)
+        client = ResilientHttpClient(
+            timeout=timeout,
+            follow_redirects=True,
+            verify=not bool(options.skip_tls_verification),
+        )
         response = await client.get(url, headers=headers)
         response.raise_for_status()
 
@@ -166,6 +190,7 @@ class ScrapingService:
         context = await self.browser.new_context(
             user_agent=settings.user_agent,
             viewport=viewport,
+            ignore_https_errors=bool(options.skip_tls_verification),
         )
         page = await context.new_page()
 
@@ -187,8 +212,9 @@ class ScrapingService:
             if options.wait_for:
                 await page.wait_for_timeout(int(options.wait_for) * 1000)
 
+            action_outputs: dict[str, Any] = {}
             if use_actions:
-                await self._apply_actions(page, options.actions, timeout_ms=int(timeout))
+                action_outputs = await self._apply_actions(page, options.actions, timeout_ms=int(timeout))
 
             # If we're not doing interactive actions, use the aggressive "zoom out"
             # heuristic to pull more lazy-loaded content into the viewport.
@@ -222,13 +248,36 @@ class ScrapingService:
             if "screenshot" in (options.formats or []):
                 screenshot_bytes = await page.screenshot(full_page=True)
                 screenshot_data = base64.b64encode(screenshot_bytes).decode()
-            
+            action_screenshot_b64 = action_outputs.get("action_screenshot_base64")
+            if screenshot_data is None and isinstance(action_screenshot_b64, str) and action_screenshot_b64:
+                screenshot_data = action_screenshot_b64
+
             document = await self._process_html_content(final_url, html_content, 200, options)
             document.url = final_url
-            
+
             if screenshot_data:
                 document.screenshot = screenshot_data
-            
+            pdf_b64 = action_outputs.get("generated_pdf_base64")
+            if isinstance(pdf_b64, str) and pdf_b64:
+                document.content_base64 = pdf_b64
+                if document.metadata is None:
+                    document.metadata = DocumentMetadata(source_url=final_url, status_code=200)
+                file_meta = dict(document.metadata.file_metadata or {})
+                file_meta["generated_pdf"] = True
+                file_meta["generated_pdf_bytes"] = len(base64.b64decode(pdf_b64))
+                action_results = action_outputs.get("action_results")
+                if isinstance(action_results, list):
+                    file_meta["action_results"] = action_results
+                    file_meta["actions_count"] = len(action_results)
+                document.metadata.file_metadata = file_meta
+            elif document.metadata is not None:
+                action_results = action_outputs.get("action_results")
+                if isinstance(action_results, list):
+                    file_meta = dict(document.metadata.file_metadata or {})
+                    file_meta["action_results"] = action_results
+                    file_meta["actions_count"] = len(action_results)
+                    document.metadata.file_metadata = file_meta
+
             return document
             
         finally:
@@ -265,68 +314,240 @@ class ScrapingService:
             if not document.markdown or len(document.markdown) < 100:
                 logger.info(f"HTML content too short, escalating to browser for {url}")
                 return await self._scrape_with_browser(url, options)
+            # `_scrape_with_http` carries `raw_html` for internal fallback checks.
+            # Do not expose it unless explicitly requested.
+            if "rawHtml" not in (options.formats or []):
+                document.raw_html = None
             logger.info(f"Successfully scraped HTML with HTTP for {url}")
             return document
         except Exception:
             logger.info(f"Initial HTTP GET failed, escalating to browser for {url}")
             return await self._scrape_with_browser(url, options)
 
-    async def _apply_actions(self, page: Page, actions: List[ScrapeAction], timeout_ms: int) -> None:
+    async def _apply_actions(self, page: Page, actions: List[ScrapeAction], timeout_ms: int) -> dict[str, Any]:
+        outputs: dict[str, Any] = {"action_results": []}
         for idx, action in enumerate(actions):
             if action is None:
                 continue
 
+            action_result = {"index": idx, "type": getattr(action, "type", None), "status": "success"}
             try:
                 action_type = (action.type or "").strip().lower()
+                selector = action.selector.strip() if isinstance(action.selector, str) and action.selector.strip() else None
+                text_or_value = (
+                    action.value
+                    if isinstance(action.value, str)
+                    else (action.text if isinstance(action.text, str) else "")
+                )
+                action_timeout_ms = int(action.milliseconds) if isinstance(action.milliseconds, int) and action.milliseconds > 0 else timeout_ms
 
                 if action_type in {"wait", "sleep"}:
                     ms = action.milliseconds if action.milliseconds is not None else 1000
                     await page.wait_for_timeout(int(ms))
+                    outputs["action_results"].append(action_result)
                     continue
 
                 if action_type in {"waitforselector", "wait_for_selector"}:
-                    if isinstance(action.selector, str) and action.selector.strip():
-                        await page.wait_for_selector(action.selector, timeout=timeout_ms)
+                    if selector:
+                        await page.wait_for_selector(selector, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
                     continue
 
                 if action_type == "click":
-                    if isinstance(action.selector, str) and action.selector.strip():
-                        await page.click(action.selector, timeout=timeout_ms)
+                    if selector:
+                        click_kwargs: dict[str, Any] = {"timeout": action_timeout_ms}
+                        if isinstance(action.button, str) and action.button.strip().lower() in {"left", "right", "middle"}:
+                            click_kwargs["button"] = action.button.strip().lower()
+                        await page.click(selector, **click_kwargs)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"doubleclick", "double_click", "dblclick"}:
+                    if selector:
+                        await page.dblclick(selector, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type == "hover":
+                    if selector:
+                        await page.hover(selector, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
                     continue
 
                 if action_type in {"type", "fill", "write"}:
-                    if isinstance(action.selector, str) and action.selector.strip():
-                        text = action.text if isinstance(action.text, str) else ""
-                        await page.fill(action.selector, text, timeout=timeout_ms)
+                    if selector:
+                        await page.fill(selector, text_or_value, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"clear", "clearinput", "clear_input"}:
+                    if selector:
+                        await page.fill(selector, "", timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type == "focus":
+                    if selector:
+                        await page.focus(selector, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type == "blur":
+                    if selector:
+                        await page.dispatch_event(selector, "blur", timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"select", "selectoption", "select_option"}:
+                    if selector:
+                        await page.select_option(selector, text_or_value, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"check", "tick"}:
+                    if selector:
+                        await page.check(selector, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"uncheck", "untick"}:
+                    if selector:
+                        await page.uncheck(selector, timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector"
+                    outputs["action_results"].append(action_result)
                     continue
 
                 if action_type in {"press", "keypress"}:
                     if isinstance(action.key, str) and action.key.strip():
-                        if isinstance(action.selector, str) and action.selector.strip():
-                            await page.press(action.selector, action.key, timeout=timeout_ms)
+                        if selector:
+                            await page.press(selector, action.key, timeout=action_timeout_ms)
                         else:
                             await page.keyboard.press(action.key)
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"keydown", "key_down"}:
+                    if isinstance(action.key, str) and action.key.strip():
+                        await page.keyboard.down(action.key)
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"keyup", "key_up"}:
+                    if isinstance(action.key, str) and action.key.strip():
+                        await page.keyboard.up(action.key)
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"waitfornavigation", "wait_for_navigation"}:
+                    await page.wait_for_load_state("load", timeout=action_timeout_ms)
+                    outputs["action_results"].append(action_result)
                     continue
 
                 if action_type == "scroll":
                     await self._scroll_page(page, action.direction, action.milliseconds)
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"draganddrop", "drag_and_drop"}:
+                    if selector and isinstance(action.target_selector, str) and action.target_selector.strip():
+                        await page.drag_and_drop(selector, action.target_selector.strip(), timeout=action_timeout_ms)
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_selector_or_target"
+                    outputs["action_results"].append(action_result)
+                    continue
+
+                if action_type in {"navigate", "goto", "go_to"}:
+                    nav_url = action.url if isinstance(action.url, str) and action.url.strip() else text_or_value
+                    if nav_url:
+                        await page.goto(nav_url, timeout=action_timeout_ms, wait_until="domcontentloaded")
+                        action_result["output"] = {"url": page.url}
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_url"
+                    outputs["action_results"].append(action_result)
                     continue
 
                 if action_type in {"evaluate", "script", "executejavascript", "execute_javascript"}:
                     script = action.script
                     if isinstance(script, str) and script.strip():
-                        await page.evaluate(script)
+                        eval_result = await page.evaluate(script)
+                        if eval_result is not None:
+                            action_result["output"] = eval_result
+                    else:
+                        action_result["status"] = "ignored"
+                        action_result["reason"] = "missing_script"
+                    outputs["action_results"].append(action_result)
                     continue
 
-                if action_type in {"scrape", "screenshot", "generatepdf", "generate_pdf"}:
-                    # These are Firecrawl v2 action types. This server always performs a final scrape
-                    # at the end of /scrape, and supports screenshots via formats. PDF generation
-                    # isn't implemented yet, so treat these as no-ops for now.
+                if action_type in {"scrape", "screenshot"}:
+                    if action_type == "screenshot":
+                        if selector:
+                            handle = await page.query_selector(selector)
+                            if handle is not None:
+                                screenshot_bytes = await handle.screenshot()
+                            else:
+                                raise ValueError(f"selector_not_found:{selector}")
+                        else:
+                            screenshot_bytes = await page.screenshot(
+                                full_page=bool(action.full_page) if action.full_page is not None else True
+                            )
+                        outputs["action_screenshot_base64"] = base64.b64encode(screenshot_bytes).decode()
+                    # "scrape" action is a no-op here because this server always performs final extraction.
+                    outputs["action_results"].append(action_result)
+                    continue
+                if action_type in {"generatepdf", "generate_pdf"}:
+                    pdf_bytes = await page.pdf(
+                        print_background=True,
+                        prefer_css_page_size=True,
+                    )
+                    outputs["generated_pdf_base64"] = base64.b64encode(pdf_bytes).decode()
+                    action_result["output"] = "generated_pdf_base64"
+                    outputs["action_results"].append(action_result)
                     continue
 
                 logger.warning(f"Unknown action type '{action.type}' at index {idx}; ignoring.")
+                action_result["status"] = "ignored"
+                action_result["reason"] = "unknown_action"
+                outputs["action_results"].append(action_result)
             except Exception as e:
                 logger.warning(f"Action {idx} failed ({getattr(action, 'type', None)}): {e}")
+                action_result["status"] = "error"
+                action_result["error"] = str(e)[:200]
+                outputs["action_results"].append(action_result)
+        return outputs
 
     async def _scroll_page(self, page: Page, direction: Optional[str], wait_ms: Optional[int]) -> None:
         d = (direction or "down").strip().lower()
@@ -344,39 +565,143 @@ class ScrapingService:
         if wait_ms is not None:
             await page.wait_for_timeout(int(wait_ms))
 
-    async def _get_file_metadata(self, url: str, headers: httpx.Headers, options: ScrapeOptions) -> FirecrawlDocument:
+    async def _get_file_metadata(
+        self,
+        url: str,
+        headers: httpx.Headers,
+        options: ScrapeOptions,
+        *,
+        verify_tls: bool = True,
+    ) -> FirecrawlDocument:
         content_type = headers.get('content-type', '').lower()
         content_length = headers.get('content-length')
-        
+
         file_meta = {"content_type": content_type, "content_length": content_length}
-        
-        if content_type == 'application/pdf':
-            page_count = await self._get_pdf_page_count_fast(url, options.headers)
+        is_pdf = content_type.startswith("application/pdf")
+        is_image = content_type.startswith("image/")
+
+        if is_pdf:
+            page_count = await self._get_pdf_page_count_fast(url, options.headers, verify_tls=verify_tls)
             file_meta['page_count'] = page_count
 
-        if content_type.startswith('image/'):
-            dimensions = await self._get_image_dimensions_fast(url, options.headers)
+        if is_image:
+            dimensions = await self._get_image_dimensions_fast(url, options.headers, verify_tls=verify_tls)
             if dimensions:
                 file_meta['width'], file_meta['height'] = dimensions
 
         doc_meta = DocumentMetadata(source_url=url, status_code=200, file_metadata=file_meta, content_type=content_type)
         document = FirecrawlDocument(url=url, metadata=doc_meta)
 
-        if options.include_file_body:
+        wants_markdown_output = any(fmt in {"markdown", "content"} for fmt in (options.formats or ["markdown"]))
+        ocr_requested = bool(options.ocr) and (is_pdf or is_image) and wants_markdown_output
+        needs_full_download = (
+            bool(options.include_file_body)
+            or (bool(options.parse_pdf) and is_pdf)
+            or ocr_requested
+        )
+        full_bytes: bytes | None = None
+        if needs_full_download:
             logger.info(f"Downloading full file body for {url}")
-            http = ResilientHttpClient(timeout=options.timeout or settings.default_timeout)
+            http = ResilientHttpClient(
+                timeout=options.timeout or settings.default_timeout,
+                verify=verify_tls,
+            )
             full_response = await http.get(url, headers={"User-Agent": settings.user_agent, **(options.headers or {})})
-            document.content_base64 = base64.b64encode(await full_response.aread()).decode()
+            full_bytes = await full_response.aread()
+
+        if options.include_file_body and full_bytes is not None:
+            document.content_base64 = base64.b64encode(full_bytes).decode()
+
+        if is_pdf and options.parse_pdf and wants_markdown_output and full_bytes:
+            try:
+                markdown, parsed_pages = await self._extract_pdf_markdown(full_bytes)
+                if markdown:
+                    document.markdown = markdown
+                    file_meta["pdf_parsed"] = True
+                    file_meta["pdf_parsed_pages"] = parsed_pages
+                    file_meta["pdf_parsed_characters"] = len(markdown)
+                else:
+                    file_meta["pdf_parsed"] = False
+                    file_meta["pdf_parsed_pages"] = 0
+            except Exception as e:
+                logger.warning(f"Could not parse PDF markdown for {url}: {e}")
+                file_meta["pdf_parsed"] = False
+                file_meta["pdf_parse_error"] = str(e)[:200]
+
+        if ocr_requested and full_bytes:
+            existing_markdown = (document.markdown or "").strip()
+            should_run_ocr = is_image or (
+                len(existing_markdown) < int(settings.document_ocr_fallback_threshold_chars)
+            )
+            if should_run_ocr:
+                try:
+                    ocr_result = await document_ocr_client.extract_markdown(
+                        file_bytes=full_bytes,
+                        content_type=content_type,
+                        source_url=url,
+                        requested_provider=options.ocr_provider,
+                        prompt=options.ocr_prompt,
+                    )
+                    ocr_markdown = ocr_result.markdown.strip()
+                    if ocr_markdown:
+                        document.markdown = ocr_markdown
+                        file_meta["ocr_applied"] = True
+                        file_meta["ocr_provider"] = ocr_result.provider
+                        file_meta["ocr_characters"] = len(ocr_markdown)
+                    else:
+                        file_meta["ocr_applied"] = False
+                        file_meta["ocr_provider"] = ocr_result.provider
+                        file_meta["ocr_error"] = "empty_ocr_output"
+                except ProviderError as e:
+                    file_meta["ocr_applied"] = False
+                    file_meta["ocr_error"] = str(e)[:200]
+                    if getattr(e, "status_code", None) is not None:
+                        file_meta["ocr_status_code"] = e.status_code
+                except Exception as e:
+                    file_meta["ocr_applied"] = False
+                    file_meta["ocr_error"] = str(e)[:200]
+            else:
+                file_meta["ocr_applied"] = False
+                file_meta["ocr_skipped"] = "pdf_text_already_sufficient"
+
+        if document.metadata is not None:
+            document.metadata.file_metadata = file_meta
 
         return document
 
-    async def _get_pdf_page_count_fast(self, url: str, req_headers: Optional[dict]) -> int:
+    async def _extract_pdf_markdown(self, pdf_bytes: bytes) -> tuple[str | None, int]:
+        def _extract() -> tuple[str | None, int]:
+            reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+            page_sections: list[str] = []
+            parsed_pages = 0
+            for idx, page in enumerate(reader.pages, start=1):
+                try:
+                    page_text = page.extract_text() or ""
+                except Exception:
+                    page_text = ""
+                page_text = page_text.strip()
+                if not page_text:
+                    continue
+                parsed_pages += 1
+                page_sections.append(f"## Page {idx}\n\n{page_text}")
+            markdown = "\n\n".join(page_sections).strip()
+            return (markdown if markdown else None, parsed_pages)
+
+        return await asyncio.to_thread(_extract)
+
+    async def _get_pdf_page_count_fast(
+        self,
+        url: str,
+        req_headers: Optional[dict],
+        *,
+        verify_tls: bool = True,
+    ) -> int:
         # First attempt: Fast ranged request
         try:
             logger.info(f"Attempting fast ranged request for PDF page count: {url}")
             # Increased range significantly for better compatibility with non-standard PDFs
             headers = {"User-Agent": settings.user_agent, **(req_headers or {}), "Range": "bytes=-4192"} # 4KB
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=15, verify=verify_tls) as client:
                 response = await client.get(url, headers=headers)
                 if 200 <= response.status_code < 300:
                     pdf_stream = io.BytesIO(response.content)
@@ -390,10 +715,16 @@ class ScrapingService:
         
         return -1
 
-    async def _get_image_dimensions_fast(self, url: str, req_headers: Optional[dict]) -> Optional[tuple[int, int]]:
+    async def _get_image_dimensions_fast(
+        self,
+        url: str,
+        req_headers: Optional[dict],
+        *,
+        verify_tls: bool = True,
+    ) -> Optional[tuple[int, int]]:
         try:
             headers = {"User-Agent": settings.user_agent, **(req_headers or {}), "Range": "bytes=0-4096"}
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, verify=verify_tls) as client:
                 response = await client.get(url, headers=headers, follow_redirects=True)
                 if 200 <= response.status_code < 300:
                     image_stream = io.BytesIO(response.content)

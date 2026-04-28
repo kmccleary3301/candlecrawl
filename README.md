@@ -27,7 +27,7 @@ CandleCrawl is a self-hostable web ingestion service for teams that need more th
 - depth-aware crawling with politeness controls and export paths,
 - Firecrawl-style `v1` and `v2` compatibility surfaces,
 - provider-backed search and extraction helpers,
-- optional Hermes-facing BCAS and cost-tracking endpoints,
+- a retired Hermes compatibility surface kept out of package artifacts,
 - a repo structure intended to remain useful as a standalone system or as a substrate inside larger research stacks.
 
 The target audience here is not "people who want a demo". It is engineers, infra-minded researchers, and platform builders who need a service they can inspect, adapt, and embed into higher-level intelligence systems.
@@ -64,7 +64,7 @@ In practice the repo currently serves three adjacent roles:
 
 1. A standalone crawl/scrape/search/extract API.
 2. A Firecrawl-style compatibility layer for `v1` / `v2` request shapes.
-3. A provider-enabled substrate used by Hermes for BCAS-style research and enrichment flows.
+3. A provider-enabled substrate used by Hermes through service and SDK boundaries.
 
 ## Capability Snapshot
 
@@ -81,7 +81,7 @@ In practice the repo currently serves three adjacent roles:
 | Crawl politeness | 🟢 | robots.txt, crawl delay, path rules, budgets | Designed for extension, not just happy path demos |
 | Provider abstraction | 🟢 | Serper, Scrape.do, OpenRouter | Useful both standalone and for Hermes integration |
 | Cost telemetry | 🟢 | `/v1/hermes/costs/*` | Research-job oriented, not generic billing |
-| Hermes BCAS research | 🟡 | `/v1/hermes/research` and helpers | Powerful, but still a compatibility/bridge surface |
+| Hermes BCAS research | ⚪ | retired `/v1/hermes/*` compatibility routes | Historical bridge code is quarantined under `legacy/` and is not packaged |
 | Public contract discipline | 🟡 | `contracts/openapi-v1.yaml` | Draft contract, versioned intentionally |
 | Distributed frontier | 🔵 | `MemoryFrontier` today | Redis/Ray-ready direction documented, not fully shipped |
 
@@ -96,10 +96,51 @@ cd candlecrawl
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e ".[service,browser,pdf,ocr,test]"
 
 python -m playwright install chromium
-python -m uvicorn app.main:app --host 0.0.0.0 --port 3010
+candlecrawl serve --host 0.0.0.0 --port 3010
+```
+
+### Package-Oriented Development
+
+CandleCrawl also exposes a lightweight installable package surface for SDK,
+CLI, and Hermes integration work:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e ".[service,browser,pdf,ocr,test]"
+
+candlecrawl version
+candlecrawl doctor
+candlecrawl serve --host 0.0.0.0 --port 3010
+```
+
+For base SDK-only usage, install without service extras:
+
+```bash
+pip install -e .
+python -c "import candlecrawl, candlecrawl.client; print(candlecrawl.__version__)"
+```
+
+The package CLI is the integration boundary for downstream systems. Service
+runtime code is packaged under the private `candlecrawl._server` namespace;
+top-level `app` is kept only in the repository as a development compatibility
+shim for older tests and scripts.
+
+SDK smoke:
+
+```python
+from candlecrawl import AsyncCandleCrawlClient
+from candlecrawl.schemas import ScrapeRequest
+
+async with AsyncCandleCrawlClient(base_url="http://127.0.0.1:3010") as client:
+    result = await client.scrape(
+        ScrapeRequest(url="https://example.com", formats=["markdown", "links"])
+    )
+    print(result.data)
 ```
 
 Health check:
@@ -220,7 +261,7 @@ Scrape and crawl requests support:
 | --- | --- |
 | `v1/*` | Lightweight Firecrawl-style compatibility and existing callers |
 | `v2/*` | Cleaner evolving contract surface |
-| `/v1/hermes/*` | Internal compatibility bridge for Hermes research and enrichment flows |
+| `/v1/hermes/*` | Retired compatibility surface; returns 410 |
 
 ## API Surface
 
@@ -256,16 +297,11 @@ Scrape and crawl requests support:
 
 ### Hermes Bridge Endpoints
 
-These are not the main public story of CandleCrawl, but they are real and useful.
+These are not the main public story of CandleCrawl. The former Hermes bridge routes are retired and return a 410 compatibility envelope.
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
-| `/v1/hermes/leads/search` | `POST` | Search via Serper for lead/entity discovery |
-| `/v1/hermes/leads/enrich` | `POST` | Scrape/enrich a set of domains |
-| `/v1/hermes/external-scrape` | `POST` | Provider-backed fallback scrape |
-| `/v1/hermes/compose` | `POST` | LLM composition helper |
-| `/v1/hermes/research` | `POST` | BCAS-style research orchestration |
-| `/v1/hermes/costs/*` | `GET` | Cost and provider-usage telemetry |
+| `/v1/hermes/*` | varied | Retired compatibility surface; use Hermes-owned APIs for higher-level research workflows |
 
 ### Contract Artifact
 
@@ -369,7 +405,7 @@ curl -sS http://127.0.0.1:3010/v2/extract \
   }'
 ```
 
-### 7. Hermes BCAS research call
+### 7. Retired Hermes BCAS research call
 
 ```bash
 curl -sS http://127.0.0.1:3010/v1/hermes/research \
@@ -466,12 +502,13 @@ candlecrawl/
 │   ├── cost_endpoints.py        # Hermes cost telemetry API
 │   ├── model_pricing.py         # Model cost estimation helpers
 │   ├── chunking.py              # Search/research-oriented chunking helpers
-│   ├── hermes_bcas.py           # BCAS-style research orchestration bridge
 │   ├── providers/
 │   │   ├── base.py              # Shared provider exception types
 │   │   ├── serper.py            # Search/news/image provider client
 │   │   ├── scrapedo.py          # Scrape.do fallback client
 │   │   └── openrouter.py        # LLM provider client for BCAS and compose flows
+├── legacy/
+│   └── hermes_bcas.py           # quarantined historical BCAS bridge; not packaged
 │   └── scripts/
 │       └── provider_smoketests.py
 ├── contracts/
@@ -548,6 +585,7 @@ CandleCrawl follows semantic versioning. See [VERSIONING.md](./VERSIONING.md).
 | [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) | Setup, env vars, first boot, smoke checks |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Runtime design, module responsibilities, queue and render model |
 | [docs/API_AND_OPERATIONS.md](./docs/API_AND_OPERATIONS.md) | Endpoint catalog, request examples, health and troubleshooting |
+| [docs/RELEASE_RUNBOOK.md](./docs/RELEASE_RUNBOOK.md) | Package, contract, clean-install, and Hermes candidate release gates |
 | [QueryLake_Integration_Plan.md](./QueryLake_Integration_Plan.md) | Planned QueryLake/Ray alignment |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | Contribution workflow and contract-change discipline |
 | [CHANGELOG.md](./CHANGELOG.md) | Release history |

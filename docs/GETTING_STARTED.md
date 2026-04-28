@@ -20,20 +20,20 @@ cd candlecrawl
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e ".[service,browser,pdf,ocr,test]"
 python -m playwright install chromium
 ```
 
 ## Running The API
 
 ```bash
-python -m uvicorn app.main:app --host 0.0.0.0 --port 3010
+candlecrawl serve --host 0.0.0.0 --port 3010
 ```
 
 If you want an alternate port:
 
 ```bash
-PORT=3010 python -m uvicorn app.main:app --host 0.0.0.0 --port 3010
+candlecrawl serve --host 0.0.0.0 --port 4010
 ```
 
 ## Health Verification

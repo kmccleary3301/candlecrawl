@@ -1,0 +1,10 @@
+prune legacy
+prune docs_tmp
+prune .pytest_cache
+recursive-exclude * __pycache__
+recursive-exclude * *.py[cod]
+recursive-exclude * .DS_Store
+exclude .env
+exclude .env.*
+exclude firecrawl.out
+exclude *.log

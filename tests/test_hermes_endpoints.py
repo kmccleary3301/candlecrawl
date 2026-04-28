@@ -1,26 +1,33 @@
 from fastapi.testclient import TestClient
+
 from app.main import app
+
 
 client = TestClient(app)
 
 
-def test_hermes_search_route_schema():
-    resp = client.post("/v1/hermes/leads/search", json={"query": "test", "limit": 2})
-    # Without real key it may error, but schema should be consistent
-    data = resp.json()
-    assert "success" in data
-    assert "results" in data or "error" in data
+def test_retired_hermes_compose_returns_410_shape() -> None:
+    resp = client.post("/v1/hermes/compose", json={"prompt": "hello"})
+    assert resp.status_code == 410
+    payload = resp.json()
+    assert payload["success"] is False
+    assert payload["code"] == "HERMES_COMPAT_RETIRED"
+    assert payload["legacyPath"] == "/v1/hermes/compose"
 
 
-def test_hermes_compose_route_schema():
-    resp = client.post("/v1/hermes/compose", json={"prompt": "Say hi"})
-    data = resp.json()
-    assert "success" in data
-    assert ("text" in data) or ("error" in data)
-
-
-def test_hermes_external_scrape_route_schema():
+def test_retired_hermes_external_scrape_returns_410_shape() -> None:
     resp = client.post("/v1/hermes/external-scrape", json={"url": "https://example.com"})
-    data = resp.json()
-    assert "success" in data
-    assert ("content" in data) or ("error" in data)
+    assert resp.status_code == 410
+    payload = resp.json()
+    assert payload["success"] is False
+    assert payload["code"] == "HERMES_COMPAT_RETIRED"
+    assert payload["legacyPath"] == "/v1/hermes/external-scrape"
+
+
+def test_retired_hermes_catch_all_handles_other_methods() -> None:
+    resp = client.get("/v1/hermes/anything")
+    assert resp.status_code == 410
+    payload = resp.json()
+    assert payload["success"] is False
+    assert payload["code"] == "HERMES_COMPAT_RETIRED"
+    assert payload["legacyPath"] == "/v1/hermes/anything"

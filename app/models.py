@@ -23,12 +23,39 @@ class WebhookConfig(BaseModel):
 class ScrapeAction(BaseModel):
     type: str
     selector: Optional[str] = None
+    target_selector: Optional[str] = Field(default=None, alias="targetSelector")
     text: Optional[str] = None
+    value: Optional[str] = None
+    url: Optional[str] = None
     key: Optional[str] = None
+    button: Optional[str] = None
     script: Optional[str] = None
     milliseconds: Optional[int] = None
     direction: Optional[str] = None
     full_page: Optional[bool] = Field(default=None, alias="fullPage")
+
+
+class ActionFieldCapability(BaseModel):
+    name: str
+    value_type: str = Field(alias="valueType")
+    required: bool = False
+    description: Optional[str] = None
+
+
+class ActionCapability(BaseModel):
+    type: str
+    aliases: List[str] = Field(default_factory=list)
+    request_fields: List[ActionFieldCapability] = Field(default_factory=list, alias="requestFields")
+    outputs: List[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+class ActionsCapabilitiesResponse(BaseModel):
+    success: bool = True
+    contract_version: str = Field(default="candlecrawl.actions.v1", alias="contractVersion")
+    actions: List[ActionCapability] = Field(default_factory=list)
+    documented_request_fields: List[str] = Field(default_factory=list, alias="documentedRequestFields")
+    documented_response_fields: List[str] = Field(default_factory=list, alias="documentedResponseFields")
 
 # Scrape options
 class ScrapeOptions(BaseModel):
@@ -45,6 +72,10 @@ class ScrapeOptions(BaseModel):
     remove_base64_images: Optional[bool] = None
     use_relative_links: Optional[bool] = False
     include_file_body: Optional[bool] = False
+    parse_pdf: Optional[bool] = False
+    ocr: Optional[bool] = False
+    ocr_provider: Optional[str] = None
+    ocr_prompt: Optional[str] = None
     actions: Optional[List[ScrapeAction]] = None
     
 # Document metadata

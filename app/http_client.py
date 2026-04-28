@@ -11,9 +11,10 @@ class ResilientHttpClient:
     This is modular and can be swapped later with provider-backed clients or proxies.
     """
 
-    def __init__(self, *, timeout: Optional[int] = None, follow_redirects: bool = True):
+    def __init__(self, *, timeout: Optional[int] = None, follow_redirects: bool = True, verify: bool = True):
         self.timeout = timeout or settings.default_timeout
         self.follow_redirects = follow_redirects
+        self.verify = verify
 
     def _compute_backoff(self, attempt: int) -> float:
         base = settings.backoff_base_ms / 1000.0
@@ -31,7 +32,11 @@ class ResilientHttpClient:
     async def get(self, url: str, *, headers: Optional[dict] = None) -> httpx.Response:
         attempts = settings.retry_max_attempts
         last_exc: Optional[Exception] = None
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=self.follow_redirects) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=self.follow_redirects,
+            verify=self.verify,
+        ) as client:
             for attempt in range(1, attempts + 1):
                 resp: Optional[httpx.Response] = None
                 try:
@@ -56,7 +61,11 @@ class ResilientHttpClient:
     async def head(self, url: str, *, headers: Optional[dict] = None) -> httpx.Response:
         attempts = settings.retry_max_attempts
         last_exc: Optional[Exception] = None
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=self.follow_redirects) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=self.follow_redirects,
+            verify=self.verify,
+        ) as client:
             for attempt in range(1, attempts + 1):
                 resp: Optional[httpx.Response] = None
                 try:
@@ -76,7 +85,6 @@ class ResilientHttpClient:
                     if attempt >= attempts or not self._should_retry(e, resp):
                         raise
                     await asyncio.sleep(self._compute_backoff(attempt))
-
 
 
 
